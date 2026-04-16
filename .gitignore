@@ -1,0 +1,24 @@
+# Keil / MDK build outputs
+MDK-ARM/Head_limit/
+*.axf
+*.bin
+*.crf
+*.d
+*.dep
+*.hex
+*.lnp
+*.map
+*.o
+*.obj
+
+# Keil user-specific files
+*.uvguix.*
+*.uvoptx
+
+# CubeMX / IDE generated transient files
+DebugConfig/
+MDK-ARM/DebugConfig/
+
+# OS noise
+Thumbs.db
+Desktop.ini
