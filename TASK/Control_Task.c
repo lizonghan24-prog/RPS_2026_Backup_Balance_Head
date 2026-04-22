@@ -1,4 +1,21 @@
-﻿#include "Control_Task.h"
+#include "Control_Task.h"
+
+/*
+ * @file Control_Task.c
+ * @brief 云台双轴控制任务。
+ *
+ * 本文件负责 Pitch / Yaw 两个 GM6020 云台电机的上层闭环：
+ * 1. 从 IMU 读取姿态角和角速度反馈；
+ * 2. 从图传遥控读取挡位、摇杆和自定义按键；
+ * 3. 根据在线状态和遥控输入决定无力、保持、手动、回中、调试模式；
+ * 4. 执行“角度外环 + 角速度内环”的双环 PID；
+ * 5. 把计算出的电流给定缓存到 motor 层，再由 motor 层按 DJI 协议发 CAN。
+ *
+ * 注意：
+ * - CAN 外设初始化、滤波器和中断接收不在本文件处理；
+ * - GM6020 反馈解析和发送打包由 BSP/motor.c 负责；
+ * - 本文件只关心任务逻辑和控制量计算。
+ */
 
 #include "PID.h"
 #include "IMU.h"
@@ -7,146 +24,7 @@
 
 #include <string.h>
 
-extern CAN_HandleTypeDef hcan1;
-extern CAN_HandleTypeDef hcan2;
-
-/* 控制任务按 1 kHz 运行，节拍由 TIM6 提供。 */
-#define CONTROL_TASK_DT_S                           0.001f
-
-/* ========================= 电机挂载配置区 ========================= */
-/* Pitch 轴当前使用 CAN1 上的 ID1 GM6020，按电流环方式控制。 */
-#define CONTROL_PITCH_MOTOR_CAN                     (&hcan1)
-#define CONTROL_PITCH_MOTOR_ID                      1U
-/* Yaw 轴当前使用 CAN2 上的 ID1 GM6020，按电流环方式控制。 */
-#define CONTROL_YAW_MOTOR_CAN                       (&hcan2)
-#define CONTROL_YAW_MOTOR_ID                        1U
-
-/* ========================= 遥控映射配置区 ========================= */
-/* 图传遥控通道中，默认 ch0 控制 yaw，ch1 控制 pitch。 */
-#define CONTROL_REMOTE_YAW_CHANNEL_INDEX            0U
-#define CONTROL_REMOTE_PITCH_CHANNEL_INDEX          1U
-/* 遥控输入映射成目标角速度，单位是 deg/s。 */
-#define CONTROL_YAW_REMOTE_SCALE_DEG_PER_S          0.18f
-#define CONTROL_PITCH_REMOTE_SCALE_DEG_PER_S        0.12f
-/* 小于死区的输入直接丢掉，避免摇杆回中附近抖动。 */
-#define CONTROL_REMOTE_DEADBAND                     10
-
-/* ========================= IMU 映射配置区 ========================= */
-/* IMU 的欧拉角数组默认按 roll、pitch、yaw 排列。 */
-#define CONTROL_IMU_PITCH_ANGLE_INDEX               1U
-#define CONTROL_IMU_YAW_ANGLE_INDEX                 2U
-/* IMU 的角速度数组默认按 x、y、z 排列，这里取 pitch 和 yaw 对应轴。 */
-#define CONTROL_IMU_PITCH_RATE_INDEX                1U
-#define CONTROL_IMU_YAW_RATE_INDEX                  2U
-
-/* ========================= 机械限位与回中配置区 ========================= */
-/* Pitch 轴按机械限位处理，Yaw 轴按回环角处理。 */
-#define CONTROL_PITCH_MIN_DEG                      -25.0f
-#define CONTROL_PITCH_MAX_DEG                       25.0f
-#define CONTROL_PITCH_CENTER_DEG                    0.0f
-#define CONTROL_PITCH_PROTECT_MARGIN_DEG            2.0f
-#define CONTROL_PITCH_WRAP_ENABLE                   0U
-
-#define CONTROL_YAW_MIN_DEG                      -180.0f
-#define CONTROL_YAW_MAX_DEG                       180.0f
-#define CONTROL_YAW_CENTER_DEG                      0.0f
-#define CONTROL_YAW_PROTECT_MARGIN_DEG              0.0f
-#define CONTROL_YAW_WRAP_ENABLE                     1U
-
-/* ========================= 模式映射配置区 ========================= */
-/* 当前约定：C 挡无力，N 挡手动，S 挡回中；暂停键始终强制无力。 */
-#define CONTROL_MODE_GEAR_RELAX                REMOTE_SWITCH_C
-#define CONTROL_MODE_GEAR_MANUAL                    REMOTE_SWITCH_N
-#define CONTROL_MODE_GEAR_RECENTER                  REMOTE_SWITCH_S
-
-/* ========================= 调试模式配置区 ========================= */
-/* 默认按住右侧自定义键进入调试模式，调试模式下左侧自定义键触发回中。 */
-#define CONTROL_DEBUG_ENABLE_BY_CUSTOM_RIGHT        1U
-#define CONTROL_DEBUG_RECENTER_BY_CUSTOM_LEFT       1U
-#define CONTROL_DEBUG_PITCH_REMOTE_SCALE_RATIO      0.25f
-#define CONTROL_DEBUG_YAW_REMOTE_SCALE_RATIO        0.25f
-#define CONTROL_DEBUG_PITCH_SPEED_LIMIT_DPS         60.0f
-#define CONTROL_DEBUG_YAW_SPEED_LIMIT_DPS           80.0f
-#define CONTROL_DEBUG_PITCH_CURRENT_LIMIT           3000.0f
-#define CONTROL_DEBUG_YAW_CURRENT_LIMIT             3500.0f
-
-/* ========================= Pitch 轴 PID 配置区 ========================= */
-#define CONTROL_PITCH_ANGLE_KP                      10.0f
-#define CONTROL_PITCH_ANGLE_KI                      0.0f
-#define CONTROL_PITCH_ANGLE_KD                      0.2f
-#define CONTROL_PITCH_ANGLE_I_LIMIT                 100.0f
-#define CONTROL_PITCH_ANGLE_OUT_LIMIT               250.0f
-
-#define CONTROL_PITCH_SPEED_KP                      90.0f
-#define CONTROL_PITCH_SPEED_KI                      8.0f
-#define CONTROL_PITCH_SPEED_KD                      0.3f
-#define CONTROL_PITCH_SPEED_I_LIMIT                 3000.0f
-#define CONTROL_PITCH_SPEED_OUT_LIMIT               12000.0f
-
-/* ========================= Yaw 轴 PID 配置区 ========================= */
-#define CONTROL_YAW_ANGLE_KP                        8.0f
-#define CONTROL_YAW_ANGLE_KI                        0.0f
-#define CONTROL_YAW_ANGLE_KD                        0.1f
-#define CONTROL_YAW_ANGLE_I_LIMIT                   100.0f
-#define CONTROL_YAW_ANGLE_OUT_LIMIT                 300.0f
-
-#define CONTROL_YAW_SPEED_KP                        80.0f
-#define CONTROL_YAW_SPEED_KI                        6.0f
-#define CONTROL_YAW_SPEED_KD                        0.25f
-#define CONTROL_YAW_SPEED_I_LIMIT                   3000.0f
-#define CONTROL_YAW_SPEED_OUT_LIMIT                 12000.0f
-
-/* 云台控制模式。 */
-typedef enum
-{
-    CONTROL_MODE_RELAX = 0U,                     /* 无力模式，直接下发 0 电流。 */
-    CONTROL_MODE_HOLD = 1U,                      /* 保持模式，锁住当前目标姿态。 */
-    CONTROL_MODE_MANUAL = 2U,                    /* 手动模式，遥控输入积分成目标角。 */
-    CONTROL_MODE_RECENTER = 3U,                  /* 回中模式，把目标角拉回中心。 */
-    CONTROL_MODE_DEBUG = 4U                      /* 调试模式，降低灵敏度和输出上限。 */
-} control_mode_t;
-
-/* 单个云台轴的控制对象。外环控角度，内环控角速度。 */
-typedef struct
-{
-    gm6020_service_t motor;                     /* 该轴绑定的 GM6020 服务对象。 */
-    pid_t angle_pid;                            /* 外环角度 PID。 */
-    pid_t speed_pid;                            /* 内环角速度 PID。 */
-    float target_angle_deg;                     /* 当前目标角度，单位 deg。 */
-    float angle_feedback_deg;                   /* 当前角度反馈，单位 deg。 */
-    float speed_feedback_dps;                   /* 当前角速度反馈，单位 deg/s。 */
-    float target_speed_dps;                     /* 外环输出的目标角速度，单位 deg/s。 */
-    float target_current;                       /* 内环输出的目标电流。 */
-    float remote_scale_deg_per_s;               /* 遥控输入到目标角速度的缩放系数。 */
-    float debug_remote_scale_ratio;             /* 调试模式下额外乘上的灵敏度比例。 */
-    float debug_speed_limit_dps;                /* 调试模式下的角速度限幅。 */
-    float debug_current_limit;                  /* 调试模式下的电流限幅。 */
-    float min_angle_deg;                        /* 角度下限。 */
-    float max_angle_deg;                        /* 角度上限。 */
-    float center_angle_deg;                     /* 回中模式使用的目标中心角。 */
-    float protect_margin_deg;                   /* 触发机械限位保护时额外预留的裕量。 */
-    uint8_t wrap_enable;                        /* 1 表示按回环角计算误差，0 表示按普通角度处理。 */
-    uint8_t limit_active;                       /* 当前是否处于限位保护状态。 */
-    uint8_t imu_angle_index;                    /* IMU 欧拉角数组中的反馈索引。 */
-    uint8_t imu_rate_index;                     /* IMU 角速度数组中的反馈索引。 */
-    uint8_t remote_channel_index;               /* 遥控通道索引。 */
-} gimbal_axis_control_t;
-
-/* 整个双轴云台任务的运行状态。 */
-typedef struct
-{
-    uint8_t initialized;                        /* 是否已经完成过一次模式切换初始化。 */
-    volatile uint32_t tick_pending;             /* 等待主循环处理的 1 kHz 节拍数。 */
-    uint8_t imu_online;                         /* IMU 在线标志。 */
-    uint8_t remote_online;                      /* 图传遥控在线标志。 */
-    uint8_t pitch_motor_online;                 /* Pitch 电机在线标志。 */
-    uint8_t yaw_motor_online;                   /* Yaw 电机在线标志。 */
-    control_mode_t mode;                        /* 本拍实际执行的模式。 */
-    control_mode_t last_mode;                   /* 上一拍实际执行的模式。 */
-    gimbal_axis_control_t yaw;                  /* Yaw 轴控制对象。 */
-    gimbal_axis_control_t pitch;                /* Pitch 轴控制对象。 */
-} gimbal_control_task_t;
-
+/* 云台任务的唯一全局上下文，所有运行时状态都集中放在这里。 */
 static gimbal_control_task_t gimbal_control;
 
 /* 把数值限制在给定区间内。 */
@@ -431,8 +309,6 @@ static void Control_HandleModeTransition(void)
  * 2. 右侧自定义键 -> DEBUG
  * 3. 挡位映射
  * 4. 兜底回 RELAX
- *
- * 这样设计以后，急停和调试入口不会被普通挡位覆盖。
  */
 static control_mode_t Control_DecodeRemoteMode(const remote_state_t *remote)
 {
@@ -605,6 +481,18 @@ static void Control_ConfigYawAxis(void)
     axis->remote_channel_index = CONTROL_REMOTE_YAW_CHANNEL_INDEX;
 }
 
+/*
+ * 初始化云台控制任务。
+ *
+ * 调用时机：
+ * - main() 完成 HAL 外设初始化和 BSP_Init() 之后调用一次。
+ *
+ * 初始化内容：
+ * - 清空任务上下文；
+ * - 注册 Pitch / Yaw 两个 GM6020 到 motor 层；
+ * - 初始化两轴角度环和速度环 PID 参数；
+ * - 默认进入 RELAX，避免上电瞬间直接输出电流。
+ */
 void Control_Task_Init(void)
 {
     memset(&gimbal_control, 0, sizeof(gimbal_control));
@@ -617,23 +505,28 @@ void Control_Task_Init(void)
     Control_ConfigYawAxis();
 }
 
+/*
+ * 云台控制任务主入口。
+ *
+ * 每次调用按下面顺序执行：
+ * 1. 获取 IMU / 遥控状态；
+ * 2. 刷新在线标志并决定当前模式；
+ * 3. 在线时刷新姿态反馈；
+ * 4. 处理模式切换带来的目标角同步和 PID 清零；
+ * 5. 根据当前模式更新目标角；
+ * 6. 执行限位保护和双环 PID；
+ * 7. 下发 GM6020 电流控制帧。
+ */
 void Control_Task_Run(void)
 {
     const imu_hi91_t *imu;
     const remote_state_t *remote;
 
-    if (gimbal_control.tick_pending == 0U)
-    {
-        return;
-    }
-
-    __disable_irq();
-    gimbal_control.tick_pending--;
-    __enable_irq();
-
+    /* 读取各模块维护的最新状态指针；底层模块负责刷新这些数据。 */
     imu = IMU_GetState();
     remote = Remote_GetState();
 
+    /* 在线状态决定是否允许闭环，安全保护优先于遥控挡位。 */
     Control_UpdateSystemStatus(imu, remote);
 
     /* IMU 在线时才刷新姿态反馈，防止用掉线数据继续控制。 */
@@ -643,9 +536,13 @@ void Control_Task_Run(void)
         Control_UpdateAxisFeedback(&gimbal_control.yaw, imu);
     }
 
+    /*
+     * 模式切换只在刚进入某个模式时执行一次，用来同步目标角和清 PID。
+     * 如果模式没有变化，则不会反复清控制器状态。
+     */
     Control_HandleModeTransition();
 
-    
+    /* RELAX 是最高优先级停机状态：清 PID、给 0 电流并立即返回。 */
     if (gimbal_control.mode == CONTROL_MODE_RELAX)
     {
         Control_StopGimbalOutput();
@@ -660,6 +557,11 @@ void Control_Task_Run(void)
     }
     else if (gimbal_control.mode == CONTROL_MODE_DEBUG)
     {
+        /*
+         * 调试模式下：
+         * - 左自定义键可临时触发回中；
+         * - 否则继续响应遥控，但使用更小的比例和更低的输出限幅。
+         */
         if ((CONTROL_DEBUG_RECENTER_BY_CUSTOM_LEFT != 0U)
          && (remote != NULL)
          && (remote->online != 0U)
@@ -693,6 +595,7 @@ void Control_Task_Run(void)
 
     if (gimbal_control.mode == CONTROL_MODE_DEBUG)
     {
+        /* 调试模式额外限制目标角速度和目标电流，方便低风险试车。 */
         Control_RunAxisDualLoop(&gimbal_control.pitch,
                                 gimbal_control.pitch.debug_speed_limit_dps,
                                 gimbal_control.pitch.debug_current_limit);
@@ -702,16 +605,11 @@ void Control_Task_Run(void)
     }
     else
     {
+        /* 正常模式使用 PID 初始化时配置的输出限幅，不再叠加调试限幅。 */
         Control_RunAxisDualLoop(&gimbal_control.pitch, 0.0f, 0.0f);
         Control_RunAxisDualLoop(&gimbal_control.yaw, 0.0f, 0.0f);
     }
 
+    /* 最后统一发 CAN，保证本次计算出的两轴输出都已经写入 motor 对象。 */
     Control_SendGimbalOutput();
 }
-
-void Control_Task_Timer1kHzCallback(void)
-{
-    gimbal_control.tick_pending++;
-}
-
-

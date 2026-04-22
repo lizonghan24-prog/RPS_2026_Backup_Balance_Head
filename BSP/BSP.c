@@ -252,7 +252,7 @@ void BSP_Init(void)
     BSP_InitCan(&hcan1, 0U);
     BSP_InitCan(&hcan2, 14U);
 
-    /* TIM6 只负责给 1 kHz 节拍，不在中断里直接跑控制。 */
+    /* TIM6 触发 1 kHz 控制周期。 */
     if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
     {
         Error_Handler();
@@ -303,11 +303,11 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    /* 这里只分发节拍，中断里不直接做闭环运算。 */
+    /* TIM6 每次到期直接执行控制任务。 */
     if (htim->Instance == TIM6)
     {
-        Control_Task_Timer1kHzCallback();
-        Shoot_Task_Timer1kHzCallback();
+        Control_Task_Run();
+        Shoot_Task_Run();
     }
 }
 

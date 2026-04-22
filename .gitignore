@@ -19,6 +19,9 @@ MDK-ARM/Head_limit/
 DebugConfig/
 MDK-ARM/DebugConfig/
 
+# Documentation
+*.md
+
 # OS noise
 Thumbs.db
 Desktop.ini

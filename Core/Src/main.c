@@ -142,9 +142,6 @@ int main(void)
     /* USER CODE BEGIN 3 */
     /* 主循环持续消费串口环形缓冲，并分发给遥控/IMU 模块解析。 */
     BSP_Poll();
-    /* 控制任务在主循环执行，1 kHz 节拍由 TIM6 中断触发。 */
-    Control_Task_Run();
-    Shoot_Task_Run();
   }
   /* USER CODE END 3 */
 }

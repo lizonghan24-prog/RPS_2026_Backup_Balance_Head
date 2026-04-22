@@ -1,4 +1,20 @@
-﻿#include "Shoot_Task.h"
+#include "Shoot_Task.h"
+
+/*
+ * @file Shoot_Task.c
+ * @brief 发射机构任务。
+ *
+ * 本文件负责两部分：
+ * 1. 摩擦轮：两路 M3508 速度闭环，负责起转、停转、速度斜坡和 ready 判定；
+ * 2. 拨盘：LK 电机角度步进闭环，只有摩擦轮转稳后才允许进入闭环。
+ *
+ * 任务安全策略：
+ * - 遥控 pause 或关键电机掉线时，摩擦轮和拨盘都回到停止状态；
+ * - 摩擦轮未达到稳定状态时，拨盘不会执行推弹；
+ * - 模式切换时清 PID 和历史步进请求，避免旧积分或旧目标造成突然动作。
+ *
+ * 电机反馈解析、在线检测和 CAN 协议打包由 BSP/motor.c 完成。
+ */
 
 #include "PID.h"
 #include "Remote.h"
@@ -6,129 +22,9 @@
 
 #include <string.h>
 
-extern CAN_HandleTypeDef hcan2;
-
-/* 发射任务按 1 kHz 运行，节拍由 TIM6 提供。 */
-#define SHOOT_TASK_DT_S                               0.001f
-
-/* ========================= 摩擦轮电机挂载配置区 ========================= */
-/* 左摩擦轮使用 CAN2 上的 ID1 M3508。 */
-#define SHOOT_FRICTION_LEFT_CAN                       (&hcan2)
-#define SHOOT_FRICTION_LEFT_ID                        1U
-/* 右摩擦轮使用 CAN2 上的 ID2 M3508。 */
-#define SHOOT_FRICTION_RIGHT_CAN                      (&hcan2)
-#define SHOOT_FRICTION_RIGHT_ID                       2U
-
-/* ========================= LK 拨盘电机挂载配置区 ========================= */
-/* 拨盘使用 CAN2 上的 ID5 LK 电机。 */
-#define SHOOT_DIAL_CAN                                (&hcan2)
-#define SHOOT_DIAL_ID                                 5U
-
-/* ========================= 摩擦轮目标转速配置区 ========================= */
-/* 默认左正右负；如果实物方向反了，直接改这里的符号。 */
-#define SHOOT_FRICTION_LEFT_TARGET_RPM                4500.0f
-#define SHOOT_FRICTION_RIGHT_TARGET_RPM              -4500.0f
-/* 启停时做速度斜坡，避免电流突变太大。 */
-#define SHOOT_FRICTION_RAMP_RPM_PER_S                 12000.0f
-
-/* ========================= 摩擦轮稳定判定配置区 ========================= */
-/* 两路摩擦轮都稳定一段时间后，才允许拨盘进入闭环。 */
-#define SHOOT_FRICTION_READY_RPM_RATIO                0.85f
-#define SHOOT_FRICTION_READY_ERROR_RPM                350.0f
-#define SHOOT_FRICTION_READY_HOLD_TICKS               200U
-
-/* ========================= 遥控映射配置区 ========================= */
-/* 默认按住左侧自定义键开启摩擦轮。 */
-#define SHOOT_ENABLE_BY_CUSTOM_LEFT                   1U
-/* 如果想让扳机也能启摩擦轮，把这里改成 1U。 */
-#define SHOOT_ENABLE_BY_TRIGGER                       0U
-/* 默认扳机上升沿记一次拨盘步进请求。 */
-#define SHOOT_DIAL_STEP_BY_TRIGGER                    1U
-
-/* ========================= 摩擦轮速度环 PID 配置区 ========================= */
-#define SHOOT_FRICTION_SPEED_KP                       5.0f
-#define SHOOT_FRICTION_SPEED_KI                       0.12f
-#define SHOOT_FRICTION_SPEED_KD                       0.0f
-#define SHOOT_FRICTION_SPEED_I_LIMIT                  3000.0f
-#define SHOOT_FRICTION_SPEED_OUT_LIMIT                10000.0f
-
-/* ========================= 拨盘步进与状态轮询配置区 ========================= */
-/* 默认一步转 45 度；如果方向反了，直接把这个值改成负数。 */
-#define SHOOT_DIAL_STEP_DEG                           45.0f
-/* 当前步进误差收敛到这个窗口内后，才继续吃下一次步进请求。 */
-#define SHOOT_DIAL_STEP_ACCEPT_ERROR_DEG              2.0f
-/* 停机状态下，按固定周期查询一次 LK 状态。 */
-#define SHOOT_DIAL_STATE_POLL_TICKS                   10U
-
-/* ========================= 拨盘角度环 PID 配置区 ========================= */
-/* 外环输入是角度误差，输出是目标角速度。 */
-#define SHOOT_DIAL_ANGLE_KP                           10.0f
-#define SHOOT_DIAL_ANGLE_KI                           0.0f
-#define SHOOT_DIAL_ANGLE_KD                           0.0f
-#define SHOOT_DIAL_ANGLE_I_LIMIT                      200.0f
-#define SHOOT_DIAL_ANGLE_OUT_LIMIT                    720.0f
-
-/* ========================= 拨盘速度环 PID 配置区 ========================= */
-/* 内环输入是角速度误差，输出是 LK 的 iq/力矩命令。 */
-#define SHOOT_DIAL_SPEED_KP                           1.2f
-#define SHOOT_DIAL_SPEED_KI                           0.08f
-#define SHOOT_DIAL_SPEED_KD                           0.0f
-#define SHOOT_DIAL_SPEED_I_LIMIT                      300.0f
-#define SHOOT_DIAL_SPEED_OUT_LIMIT                    800.0f
-
-/* 单个摩擦轮的控制对象。 */
-typedef struct
-{
-    m3508_service_t motor;                           /* 当前摩擦轮绑定的 M3508 服务对象。 */
-    pid_t speed_pid;                                 /* 当前摩擦轮的速度环 PID。 */
-    float target_rpm;                                /* 目标转速，单位 rpm。 */
-    float command_rpm;                               /* 经过斜坡后的实际指令转速，单位 rpm。 */
-    float feedback_rpm;                              /* 当前反馈转速，单位 rpm。 */
-    float target_current;                            /* 速度环输出的目标电流。 */
-} shoot_friction_wheel_t;
-
-/* LK 拨盘控制对象。 */
-typedef struct
-{
-    lk_motor_service_t motor;                        /* 当前拨盘绑定的 LK 电机服务对象。 */
-    pid_t angle_pid;                                 /* 拨盘外环角度 PID。 */
-    pid_t speed_pid;                                 /* 拨盘内环速度 PID。 */
-    float step_angle_deg;                            /* 单次步进角度，单位 deg。 */
-    float target_angle_deg;                          /* 当前目标角度，单位 deg。 */
-    float feedback_angle_deg;                        /* 当前反馈角度，单位 deg。 */
-    float feedback_speed_dps;                        /* 当前反馈角速度，单位 deg/s。 */
-    float target_speed_dps;                          /* 外环输出的目标角速度，单位 deg/s。 */
-    float target_iq;                                 /* 内环输出的目标 iq/力矩命令。 */
-    uint8_t last_trigger_pressed;                    /* 上一拍扳机状态，用来检测上升沿。 */
-    uint16_t pending_step_count;                     /* 尚未执行的步进请求数量。 */
-    uint32_t total_step_count;                       /* 上电以来累计执行的步进次数。 */
-    uint16_t state_poll_tick;                        /* 停机轮询 LK 状态用的分频计数。 */
-} shoot_dial_t;
-
-/* 整个发射任务的运行状态。 */
-typedef struct
-{
-    uint8_t friction_initialized;                    /* 是否已经完成过一次摩擦轮模式初始化。 */
-    uint8_t dial_initialized;                        /* 是否已经完成过一次拨盘模式初始化。 */
-    volatile uint32_t tick_pending;                  /* 等待主循环处理的 1 kHz 节拍数。 */
-    uint8_t remote_online;                           /* 图传遥控在线标志。 */
-    uint8_t left_motor_online;                       /* 左摩擦轮在线标志。 */
-    uint8_t right_motor_online;                      /* 右摩擦轮在线标志。 */
-    uint8_t dial_motor_online;                       /* LK 拨盘在线标志。 */
-    uint8_t software_enable_request;                 /* 软件侧是否请求开启摩擦轮。 */
-    uint8_t remote_enable_request;                   /* 遥控侧是否请求开启摩擦轮。 */
-    uint8_t friction_ready;                          /* 两路摩擦轮是否已经转稳。 */
-    uint16_t friction_ready_ticks;                   /* 摩擦轮稳定累计计数。 */
-    shoot_friction_mode_t friction_mode;             /* 当前摩擦轮实际模式。 */
-    shoot_friction_mode_t last_friction_mode;        /* 上一拍摩擦轮实际模式。 */
-    shoot_dial_mode_t dial_mode;                     /* 当前拨盘实际模式。 */
-    shoot_dial_mode_t last_dial_mode;                /* 上一拍拨盘实际模式。 */
-    shoot_friction_wheel_t left;                     /* 左摩擦轮控制对象。 */
-    shoot_friction_wheel_t right;                    /* 右摩擦轮控制对象。 */
-    shoot_dial_t dial;                               /* 拨盘控制对象。 */
-} shoot_task_t;
-
+/* 发射任务内部上下文，保存摩擦轮、拨盘和模式状态。 */
 static shoot_task_t shoot_task_ctx;
+/* 对外只暴露这份快照，避免其他模块直接改内部控制状态。 */
 static shoot_task_state_t shoot_task_state_view;
 
 /* 取浮点数绝对值。 */
@@ -666,6 +562,18 @@ static void Shoot_UpdatePublicState(void)
     shoot_task_state_view.dial_target_iq = shoot_task_ctx.dial.target_iq;
 }
 
+/*
+ * 初始化发射任务。
+ *
+ * 调用时机：
+ * - main() 完成 BSP_Init() 和 motor 层初始化后调用一次。
+ *
+ * 初始化内容：
+ * - 注册左右摩擦轮 M3508 和 LK 拨盘电机；
+ * - 初始化摩擦轮速度 PID、拨盘角度 PID、拨盘速度 PID；
+ * - 设置默认摩擦轮目标转速和拨盘单步角度；
+ * - 主动查询一次 LK 状态，让在线检测更快建立。
+ */
 void Shoot_Task_Init(void)
 {
     memset(&shoot_task_ctx, 0, sizeof(shoot_task_ctx));
@@ -742,66 +650,89 @@ void Shoot_Task_Init(void)
     Shoot_UpdatePublicState();
 }
 
+/*
+ * 发射任务主入口。
+ *
+ * 每次调用按下面顺序执行：
+ * 1. 根据节拍门控决定是否处理本拍；
+ * 2. 获取遥控状态并刷新电机在线标志；
+ * 3. 更新摩擦轮模式，处理模式切换；
+ * 4. 执行摩擦轮速度环或停机输出；
+ * 5. 根据摩擦轮转稳状态决定拨盘是否允许闭环；
+ * 6. 处理拨盘步进请求并执行拨盘闭环或停机轮询；
+ * 7. 统一发送摩擦轮电流帧并刷新对外状态快照。
+ */
 void Shoot_Task_Run(void)
 {
     const remote_state_t *remote;
 
-    if (shoot_task_ctx.tick_pending == 0U)
-    {
-        return;
-    }
-
-    __disable_irq();
-    shoot_task_ctx.tick_pending--;
-    __enable_irq();
-
+    /* 遥控模块维护最新状态，本任务只读取快照。 */
     remote = Remote_GetState();
 
+    /* 在线状态和遥控请求共同决定摩擦轮能否运行。 */
     Shoot_UpdateOnlineFlags(remote);
     Shoot_UpdateFrictionMode(remote);
     Shoot_HandleFrictionModeTransition();
+
+    /* 先把反馈同步到控制对象，再执行速度环。 */
     Shoot_UpdateWheelFeedback(&shoot_task_ctx.left);
     Shoot_UpdateWheelFeedback(&shoot_task_ctx.right);
 
     if (shoot_task_ctx.friction_mode == SHOOT_FRICTION_MODE_RUN)
     {
+        /* RUN 模式下，两路摩擦轮分别做速度环，输出先缓存到 motor 对象。 */
         Shoot_RunWheelSpeedLoop(&shoot_task_ctx.left);
         Shoot_RunWheelSpeedLoop(&shoot_task_ctx.right);
     }
     else
     {
+        /* STOP 或保护状态下，持续把摩擦轮输出拉为 0。 */
         Shoot_StopFrictionOutput();
     }
 
+    /* 摩擦轮 ready 是拨盘闭环的前置联锁。 */
     Shoot_UpdateFrictionReady();
     Shoot_UpdateDialMode();
     Shoot_HandleDialModeTransition();
+
+    /* 遥控扳机只在拨盘允许闭环时转化为步进请求。 */
     Shoot_UpdateRemoteDialStepRequest(remote);
 
     if (shoot_task_ctx.dial_mode == SHOOT_DIAL_MODE_CLOSED_LOOP)
     {
+        /* 闭环模式：处理步进队列，执行角度环和速度环，并立即发送 LK iq 控制。 */
         Shoot_RunDialClosedLoop();
     }
     else
     {
+        /* 停机模式：不输出力矩，只定期查询状态来维持在线检测。 */
         Shoot_RunDialStopState();
     }
 
+    /* M3508 两个摩擦轮同属 CAN2 ID1~ID4，一帧一起发。 */
     Shoot_SendFrictionOutput();
+    /* 最后刷新给上层看的状态快照。 */
     Shoot_UpdatePublicState();
 }
 
-void Shoot_Task_Timer1kHzCallback(void)
-{
-    shoot_task_ctx.tick_pending++;
-}
-
+/*
+ * 软件侧控制摩擦轮启停。
+ *
+ * enable != 0 表示软件请求启动；真正是否 RUN 还要经过在线状态、pause、
+ * 遥控请求等联锁判断。
+ */
 void Shoot_Task_SetFrictionEnable(uint8_t enable)
 {
     shoot_task_ctx.software_enable_request = (uint8_t)((enable != 0U) ? 1U : 0U);
     Shoot_UpdatePublicState();
 }
 
+/*
+ * 软件侧修改摩擦轮目标转速。
+ *
+ * 这里只改目标值，不会立刻给电机一个阶跃；实际 command_rpm 会在任务运行时
+ * 按 SHOOT_FRICTION_RAMP_RPM_PER_S 做斜坡逼近。
+ */
 void Shoot_Task_SetFrictionTargetRpm(float left_target_rpm, float right_target_rpm)
 {
     shoot_task_ctx.left.target_rpm = left_target_rpm;
@@ -809,6 +740,12 @@ void Shoot_Task_SetFrictionTargetRpm(float left_target_rpm, float right_target_r
     Shoot_UpdatePublicState();
 }
 
+/*
+ * 追加拨盘步进请求。
+ *
+ * 只有拨盘已经处于 CLOSED_LOOP 时才接受请求。
+ * 请求会进入 pending_step_count 队列，由 Shoot_RunDialClosedLoop() 在目标角收敛后逐个执行。
+ */
 void Shoot_Task_RequestDialStep(uint16_t step_count)
 {
     if ((step_count == 0U) || (shoot_task_ctx.dial_mode != SHOOT_DIAL_MODE_CLOSED_LOOP))
@@ -820,10 +757,14 @@ void Shoot_Task_RequestDialStep(uint16_t step_count)
     Shoot_UpdatePublicState();
 }
 
+/*
+ * 获取发射任务状态快照。
+ *
+ * 返回的是只读指针，调用者可以用它做调试显示、上位机上传或其他状态判断。
+ */
 const shoot_task_state_t *Shoot_Task_GetState(void)
 {
     Shoot_UpdatePublicState();
     return &shoot_task_state_view;
 }
-
 
