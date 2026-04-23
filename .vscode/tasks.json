@@ -1,0 +1,64 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "git: push origin main",
+      "type": "shell",
+      "command": "git",
+      "args": [
+        "push",
+        "origin",
+        "main"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "git: push balance Lee_Zonghan",
+      "type": "shell",
+      "command": "git",
+      "args": [
+        "fetch",
+        "balance",
+        "Lee_Zonghan"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "git: force push balance Lee_Zonghan",
+      "type": "shell",
+      "command": "git",
+      "args": [
+        "push",
+        "--force-with-lease",
+        "balance",
+        "main:Lee_Zonghan"
+      ],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      "label": "git: push both remotes",
+      "dependsOn": [
+        "git: push origin main",
+        "git: push balance Lee_Zonghan",
+        "git: force push balance Lee_Zonghan"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    }
+  ]
+}
