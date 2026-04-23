@@ -6,8 +6,8 @@
  *
  * 本文件负责 Pitch / Yaw 两个 GM6020 云台电机的上层闭环：
  * 1. 从 IMU 读取姿态角和角速度反馈；
- * 2. 从图传遥控读取挡位、摇杆和自定义按键；
- * 3. 根据在线状态和遥控输入决定无力、保持、手动、回中、调试模式；
+ * 2. 从图传遥控读取挡位、摇杆和鼠标输入；
+ * 3. 根据在线状态和遥控输入决定无力、遥控器、键鼠模式；
  * 4. 执行“角度外环 + 角速度内环”的双环 PID；
  * 5. 把计算出的电流给定缓存到 motor 层，再由 motor 层按 DJI 协议发 CAN。
  *
@@ -25,7 +25,7 @@
 #include <string.h>
 
 /* 云台任务的唯一全局上下文，所有运行时状态都集中放在这里。 */
-static gimbal_control_task_t gimbal_control;
+gimbal_control_task_t gimbal_control;
 
 /* 把数值限制在给定区间内。 */
 static float Control_Limit(float value, float min_value, float max_value)
@@ -41,17 +41,6 @@ static float Control_Limit(float value, float min_value, float max_value)
     }
 
     return value;
-}
-
-/* 做对称限幅。limit 小于等于 0 时表示不额外限幅。 */
-static float Control_LimitSymmetric(float value, float limit)
-{
-    if (limit <= 0.0f)
-    {
-        return value;
-    }
-
-    return Control_Limit(value, -limit, limit);
 }
 
 /* 把角度规范到 [-180, 180]。 */
@@ -106,17 +95,21 @@ static void Control_AlignAxisTargetToFeedback(gimbal_axis_control_t *axis)
     Control_ClampAxisTarget(axis);
 }
 
-/* 把目标角直接设置到回中角。 */
-static void Control_SetAxisTargetToCenter(gimbal_axis_control_t *axis)
-{
-    axis->target_angle_deg = axis->center_angle_deg;
-    Control_ClampAxisTarget(axis);
-}
-
 /* 给单路遥控输入做死区处理。 */
 static int16_t Control_ApplyRemoteDeadband(int16_t input)
 {
     if ((input < CONTROL_REMOTE_DEADBAND) && (input > -CONTROL_REMOTE_DEADBAND))
+    {
+        return 0;
+    }
+
+    return input;
+}
+
+/* 给鼠标输入做死区处理，滤掉静止附近的小抖动。 */
+static int16_t Control_ApplyMouseDeadband(int16_t input)
+{
+    if ((input < CONTROL_MOUSE_DEADBAND) && (input > -CONTROL_MOUSE_DEADBAND))
     {
         return 0;
     }
@@ -148,6 +141,20 @@ static void Control_UpdateAxisTargetByRemote(gimbal_axis_control_t *axis,
     delta_angle_deg = (float)input
                     * axis->remote_scale_deg_per_s
                     * scale_ratio
+                    * CONTROL_TASK_DT_S;
+    axis->target_angle_deg += delta_angle_deg;
+    Control_ClampAxisTarget(axis);
+}
+
+/* 键鼠模式下根据鼠标输入更新单个轴的目标角。 */
+static void Control_UpdateAxisTargetByMouse(gimbal_axis_control_t *axis, int16_t mouse_input)
+{
+    float delta_angle_deg;
+    int16_t input;
+
+    input = Control_ApplyMouseDeadband(mouse_input);
+    delta_angle_deg = (float)input
+                    * axis->mouse_scale_deg_per_s
                     * CONTROL_TASK_DT_S;
     axis->target_angle_deg += delta_angle_deg;
     Control_ClampAxisTarget(axis);
@@ -192,9 +199,7 @@ static void Control_ApplyAxisLimitProtection(gimbal_axis_control_t *axis)
 }
 
 /* 执行单个轴的双环 PID。 */
-static void Control_RunAxisDualLoop(gimbal_axis_control_t *axis,
-                                    float speed_limit_dps,
-                                    float current_limit)
+static void Control_RunAxisDualLoop(gimbal_axis_control_t *axis)
 {
     float angle_error;
 
@@ -203,11 +208,9 @@ static void Control_RunAxisDualLoop(gimbal_axis_control_t *axis,
                                          axis->wrap_enable);
 
     axis->target_speed_dps = PID_CalculateByError(&axis->angle_pid, angle_error);
-    axis->target_speed_dps = Control_LimitSymmetric(axis->target_speed_dps, speed_limit_dps);
     axis->target_current = PID_Calculate(&axis->speed_pid,
                                          axis->target_speed_dps,
                                          axis->speed_feedback_dps);
-    axis->target_current = Control_LimitSymmetric(axis->target_current, current_limit);
 
     Motor_SetGm6020CurrentLoopOutput(&axis->motor, (int16_t)axis->target_current);
 }
@@ -235,13 +238,6 @@ static void Control_AlignAllTargetsToFeedback(void)
     Control_AlignAxisTargetToFeedback(&gimbal_control.yaw);
 }
 
-/* 把两轴目标角都设置成回中角。 */
-static void Control_SetAllTargetsToCenter(void)
-{
-    Control_SetAxisTargetToCenter(&gimbal_control.pitch);
-    Control_SetAxisTargetToCenter(&gimbal_control.yaw);
-}
-
 /*
  * 模式切换时统一处理目标角和 PID 状态。
  *
@@ -267,25 +263,13 @@ static void Control_HandleModeTransition(void)
             Control_ResetAxisState(&gimbal_control.yaw);
             break;
 
-        case CONTROL_MODE_HOLD:
+        case CONTROL_MODE_REMOTE:
             Control_AlignAllTargetsToFeedback();
             Control_ClearAxisController(&gimbal_control.pitch);
             Control_ClearAxisController(&gimbal_control.yaw);
             break;
 
-        case CONTROL_MODE_MANUAL:
-            Control_AlignAllTargetsToFeedback();
-            Control_ClearAxisController(&gimbal_control.pitch);
-            Control_ClearAxisController(&gimbal_control.yaw);
-            break;
-
-        case CONTROL_MODE_RECENTER:
-            Control_SetAllTargetsToCenter();
-            Control_ClearAxisController(&gimbal_control.pitch);
-            Control_ClearAxisController(&gimbal_control.yaw);
-            break;
-
-        case CONTROL_MODE_DEBUG:
+        case CONTROL_MODE_KEY_MOUSE:
             Control_AlignAllTargetsToFeedback();
             Control_ClearAxisController(&gimbal_control.pitch);
             Control_ClearAxisController(&gimbal_control.yaw);
@@ -306,15 +290,16 @@ static void Control_HandleModeTransition(void)
  *
  * 当前优先级从高到低是：
  * 1. pause -> RELAX
- * 2. 右侧自定义键 -> DEBUG
- * 3. 挡位映射
- * 4. 兜底回 RELAX
+ * 2. C 挡 -> RELAX
+ * 3. N 挡 -> REMOTE
+ * 4. S 挡 -> KEY_MOUSE
+ * 5. 兜底回 RELAX
  */
 static control_mode_t Control_DecodeRemoteMode(const remote_state_t *remote)
 {
     if ((remote == NULL) || (remote->online == 0U))
     {
-        return CONTROL_MODE_HOLD;
+        return CONTROL_MODE_RELAX;
     }
 
     if (remote->pause_pressed != 0U)
@@ -322,19 +307,14 @@ static control_mode_t Control_DecodeRemoteMode(const remote_state_t *remote)
         return CONTROL_MODE_RELAX;
     }
 
-    if ((CONTROL_DEBUG_ENABLE_BY_CUSTOM_RIGHT != 0U) && (remote->custom_right_pressed != 0U))
+    if (remote->gear == CONTROL_MODE_GEAR_REMOTE)
     {
-        return CONTROL_MODE_DEBUG;
+        return CONTROL_MODE_REMOTE;
     }
 
-    if (remote->gear == CONTROL_MODE_GEAR_MANUAL)
+    if (remote->gear == CONTROL_MODE_GEAR_KEY_MOUSE)
     {
-        return CONTROL_MODE_MANUAL;
-    }
-
-    if (remote->gear == CONTROL_MODE_GEAR_RECENTER)
-    {
-        return CONTROL_MODE_RECENTER;
+        return CONTROL_MODE_KEY_MOUSE;
     }
 
     if (remote->gear == CONTROL_MODE_GEAR_RELAX)
@@ -424,12 +404,9 @@ static void Control_ConfigPitchAxis(void)
              CONTROL_PITCH_SPEED_OUT_LIMIT);
 
     axis->remote_scale_deg_per_s = CONTROL_PITCH_REMOTE_SCALE_DEG_PER_S;
-    axis->debug_remote_scale_ratio = CONTROL_DEBUG_PITCH_REMOTE_SCALE_RATIO;
-    axis->debug_speed_limit_dps = CONTROL_DEBUG_PITCH_SPEED_LIMIT_DPS;
-    axis->debug_current_limit = CONTROL_DEBUG_PITCH_CURRENT_LIMIT;
+    axis->mouse_scale_deg_per_s = CONTROL_MOUSE_PITCH_SCALE_DEG_PER_S;
     axis->min_angle_deg = CONTROL_PITCH_MIN_DEG;
     axis->max_angle_deg = CONTROL_PITCH_MAX_DEG;
-    axis->center_angle_deg = CONTROL_PITCH_CENTER_DEG;
     axis->protect_margin_deg = CONTROL_PITCH_PROTECT_MARGIN_DEG;
     axis->wrap_enable = CONTROL_PITCH_WRAP_ENABLE;
     axis->imu_angle_index = CONTROL_IMU_PITCH_ANGLE_INDEX;
@@ -468,12 +445,9 @@ static void Control_ConfigYawAxis(void)
              CONTROL_YAW_SPEED_OUT_LIMIT);
 
     axis->remote_scale_deg_per_s = CONTROL_YAW_REMOTE_SCALE_DEG_PER_S;
-    axis->debug_remote_scale_ratio = CONTROL_DEBUG_YAW_REMOTE_SCALE_RATIO;
-    axis->debug_speed_limit_dps = CONTROL_DEBUG_YAW_SPEED_LIMIT_DPS;
-    axis->debug_current_limit = CONTROL_DEBUG_YAW_CURRENT_LIMIT;
+    axis->mouse_scale_deg_per_s = CONTROL_MOUSE_YAW_SCALE_DEG_PER_S;
     axis->min_angle_deg = CONTROL_YAW_MIN_DEG;
     axis->max_angle_deg = CONTROL_YAW_MAX_DEG;
-    axis->center_angle_deg = CONTROL_YAW_CENTER_DEG;
     axis->protect_margin_deg = CONTROL_YAW_PROTECT_MARGIN_DEG;
     axis->wrap_enable = CONTROL_YAW_WRAP_ENABLE;
     axis->imu_angle_index = CONTROL_IMU_YAW_ANGLE_INDEX;
@@ -501,7 +475,7 @@ void Control_Task_Init(void)
 
     /* 当前工程约定：Pitch 用 CAN1 上的 ID1 GM6020 电流环。 */
     Control_ConfigPitchAxis();
-    /* 当前工程约定：Yaw 用 CAN2 上的 ID1 GM6020 电流环。 */
+    /* 当前工程约定：Yaw 用 CAN2 上的 ID5 GM6020 电流环。 */
     Control_ConfigYawAxis();
 }
 
@@ -513,7 +487,7 @@ void Control_Task_Init(void)
  * 2. 刷新在线标志并决定当前模式；
  * 3. 在线时刷新姿态反馈；
  * 4. 处理模式切换带来的目标角同步和 PID 清零；
- * 5. 根据当前模式更新目标角；
+ * 5. 根据当前模式用摇杆或鼠标更新目标角；
  * 6. 执行限位保护和双环 PID；
  * 7. 下发 GM6020 电流控制帧。
  */
@@ -550,66 +524,33 @@ void Control_Task_Run(void)
         return;
     }
 
-    /* 回中模式不接收遥控量，只把目标角往中心拉。 */
-    if (gimbal_control.mode == CONTROL_MODE_RECENTER)
-    {
-        Control_SetAllTargetsToCenter();
-    }
-    else if (gimbal_control.mode == CONTROL_MODE_DEBUG)
-    {
-        /*
-         * 调试模式下：
-         * - 左自定义键可临时触发回中；
-         * - 否则继续响应遥控，但使用更小的比例和更低的输出限幅。
-         */
-        if ((CONTROL_DEBUG_RECENTER_BY_CUSTOM_LEFT != 0U)
-         && (remote != NULL)
-         && (remote->online != 0U)
-         && (remote->custom_left_pressed != 0U))
-        {
-            Control_SetAllTargetsToCenter();
-        }
-        else
-        {
-            Control_UpdateAxisTargetByRemote(&gimbal_control.pitch,
-                                             remote,
-                                             gimbal_control.pitch.debug_remote_scale_ratio);
-            Control_UpdateAxisTargetByRemote(&gimbal_control.yaw,
-                                             remote,
-                                             gimbal_control.yaw.debug_remote_scale_ratio);
-        }
-    }
-    else if (gimbal_control.mode == CONTROL_MODE_MANUAL)
+    if (gimbal_control.mode == CONTROL_MODE_REMOTE)
     {
         Control_UpdateAxisTargetByRemote(&gimbal_control.pitch, remote, 1.0f);
         Control_UpdateAxisTargetByRemote(&gimbal_control.yaw, remote, 1.0f);
     }
+    else if (gimbal_control.mode == CONTROL_MODE_KEY_MOUSE)
+    {
+        Control_UpdateAxisTargetByMouse(&gimbal_control.pitch, remote->mouse_y);
+        Control_UpdateAxisTargetByMouse(&gimbal_control.yaw, remote->mouse_x);
+    }
     else
     {
-        /* HOLD 模式保持现有目标角，不再积分新的遥控量。 */
+        /* 未知模式兜底不更新目标角，后续模式解码会回到 RELAX。 */
     }
 
     /* 双环计算前先做一次目标约束和机械限位保护。 */
     Control_ApplyAxisLimitProtection(&gimbal_control.pitch);
     Control_ApplyAxisLimitProtection(&gimbal_control.yaw);
 
-    if (gimbal_control.mode == CONTROL_MODE_DEBUG)
-    {
-        /* 调试模式额外限制目标角速度和目标电流，方便低风险试车。 */
-        Control_RunAxisDualLoop(&gimbal_control.pitch,
-                                gimbal_control.pitch.debug_speed_limit_dps,
-                                gimbal_control.pitch.debug_current_limit);
-        Control_RunAxisDualLoop(&gimbal_control.yaw,
-                                gimbal_control.yaw.debug_speed_limit_dps,
-                                gimbal_control.yaw.debug_current_limit);
-    }
-    else
-    {
-        /* 正常模式使用 PID 初始化时配置的输出限幅，不再叠加调试限幅。 */
-        Control_RunAxisDualLoop(&gimbal_control.pitch, 0.0f, 0.0f);
-        Control_RunAxisDualLoop(&gimbal_control.yaw, 0.0f, 0.0f);
-    }
+    Control_RunAxisDualLoop(&gimbal_control.pitch);
+    Control_RunAxisDualLoop(&gimbal_control.yaw);
 
     /* 最后统一发 CAN，保证本次计算出的两轴输出都已经写入 motor 对象。 */
-    Control_SendGimbalOutput();
+    //Control_SendGimbalOutput();
+}
+
+const gimbal_control_task_t *Control_Task_GetState(void)
+{
+    return &gimbal_control;
 }

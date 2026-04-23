@@ -753,8 +753,8 @@ void Shoot_Task_RequestDialStep(uint16_t step_count)
         return;
     }
 
-    Shoot_AddDialPendingStep(step_count);
-    Shoot_UpdatePublicState();
+    //Shoot_AddDialPendingStep(step_count);
+    //Shoot_UpdatePublicState();
 }
 
 /*

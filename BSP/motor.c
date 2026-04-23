@@ -2,27 +2,16 @@
 
 #include <string.h>
 
-extern CAN_HandleTypeDef hcan1;
-extern CAN_HandleTypeDef hcan2;
 
 /*
- * 电机服务层职责说明：
- * 1. 上层任务注册“某个电机对象在某一路 CAN、某个 ID 上”；
- * 2. BSP 收到 CAN 帧后调用 Motor_ProcessCanMessage()；
- * 3. 本文件按 hcan + StdId 找到对象，刷新反馈、在线标志和时间戳；
- * 4. 上层任务写 output 后，调用发送函数把同组电机一次性打包发出。
- *
- * 注意：本文件不负责 CAN 外设初始化，也不负责闭环 PID 计算。
- */
+ * 鐢垫満鏈嶅姟灞傝亴璐ｈ鏄庯細
+ * 1. 涓婂眰浠诲姟娉ㄥ唽鈥滄煇涓數鏈哄璞″湪鏌愪竴璺?CAN銆佹煇涓?ID 涓娾€濓紱
+ * 2. BSP 鏀跺埌 CAN 甯у悗璋冪敤 Motor_ProcessCanMessage()锛? * 3. 鏈枃浠舵寜 hcan + StdId 鎵惧埌瀵硅薄锛屽埛鏂板弽棣堛€佸湪绾挎爣蹇楀拰鏃堕棿鎴筹紱
+ * 4. 涓婂眰浠诲姟鍐?output 鍚庯紝璋冪敤鍙戦€佸嚱鏁版妸鍚岀粍鐢垫満涓€娆℃€ф墦鍖呭彂鍑恒€? *
+ * 娉ㄦ剰锛氭湰鏂囦欢涓嶈礋璐?CAN 澶栬鍒濆鍖栵紝涔熶笉璐熻矗闂幆 PID 璁＄畻銆? */
 
 /*
- * DJI 常用标准帧 ID：
- * - M3508/M2006 反馈：0x201 ~ 0x208，对应电机 ID1 ~ ID8；
- * - M3508/M2006 控制：ID1~ID4 发 0x200，ID5~ID8 发 0x1FF；
- * - GM6020 反馈：0x205 ~ 0x20B，对应电机 ID1 ~ ID7；
- * - GM6020 电流控制：ID1~ID4 发 0x1FE，ID5~ID7 发 0x2FE；
- * - GM6020 电压控制：ID1~ID4 发 0x1FF，ID5~ID7 发 0x2FF。
- */
+ * DJI 甯哥敤鏍囧噯甯?ID锛? * - M3508/M2006 鍙嶉锛?x201 ~ 0x208锛屽搴旂數鏈?ID1 ~ ID8锛? * - M3508/M2006 鎺у埗锛欼D1~ID4 鍙?0x200锛孖D5~ID8 鍙?0x1FF锛? * - GM6020 鍙嶉锛?x205 ~ 0x20B锛屽搴旂數鏈?ID1 ~ ID7锛? * - GM6020 鐢垫祦鎺у埗锛欼D1~ID4 鍙?0x1FE锛孖D5~ID7 鍙?0x2FE锛? * - GM6020 鐢靛帇鎺у埗锛欼D1~ID4 鍙?0x1FF锛孖D5~ID7 鍙?0x2FF銆? */
 #define MOTOR_DJI_M3508_FEEDBACK_BASE           0x200U
 #define MOTOR_DJI_GM6020_FEEDBACK_BASE          0x204U
 #define MOTOR_DJI_M3508_CMD_LOW                 0x200U
@@ -33,47 +22,43 @@ extern CAN_HandleTypeDef hcan2;
 #define MOTOR_DJI_GM6020_VOLTAGE_CMD_HIGH       0x2FFU
 
 /*
- * LK / RMD 常用标准帧 ID 和命令字。
- * 电机 ID5 对应 StdId 0x145，也就是 0x140 + 5。
- */
+ * LK / RMD 甯哥敤鏍囧噯甯?ID 鍜屽懡浠ゅ瓧銆? * 鐢垫満 ID5 瀵瑰簲 StdId 0x145锛屼篃灏辨槸 0x140 + 5銆? */
 #define MOTOR_LK_STD_ID_BASE                    0x140U
 #define MOTOR_LK_CMD_STOP                       0x81U
 #define MOTOR_LK_CMD_POWER_ON                   0x88U
 #define MOTOR_LK_CMD_READ_STATE_2               0x9CU
 #define MOTOR_LK_CMD_IQ_CONTROL                 0xA1U
 
-#define MOTOR_MAX_GM6020_COUNT                  8U      /* GM6020 注册表容量，足够覆盖一条 CAN 上的常用 ID。 */
-#define MOTOR_MAX_M3508_COUNT                   8U      /* M3508/M2006 注册表容量，对应 DJI ID1~ID8。 */
-#define MOTOR_MAX_LK_COUNT                      8U      /* LK 注册表容量，当前拨盘只用 1 个，预留扩展。 */
+#define MOTOR_MAX_GM6020_COUNT                  8U      /* GM6020 娉ㄥ唽琛ㄥ閲忥紝瓒冲瑕嗙洊涓€鏉?CAN 涓婄殑甯哥敤 ID銆?*/
+#define MOTOR_MAX_M3508_COUNT                   8U      /* M3508/M2006 娉ㄥ唽琛ㄥ閲忥紝瀵瑰簲 DJI ID1~ID8銆?*/
+#define MOTOR_MAX_LK_COUNT                      8U      /* LK 娉ㄥ唽琛ㄥ閲忥紝褰撳墠鎷ㄧ洏鍙敤 1 涓紝棰勭暀鎵╁睍銆?*/
 
 static gm6020_service_t *gm6020_registry[MOTOR_MAX_GM6020_COUNT];
 static m3508_service_t *m3508_registry[MOTOR_MAX_M3508_COUNT];
 static lk_motor_service_t *lk_registry[MOTOR_MAX_LK_COUNT];
 
 /*
- * 注册表只保存对象指针，不申请也不释放内存。
- * 因此传进 Register 函数的对象必须是全局、静态或长期存在的任务上下文成员。
- */
+ * 娉ㄥ唽琛ㄥ彧淇濆瓨瀵硅薄鎸囬拡锛屼笉鐢宠涔熶笉閲婃斁鍐呭瓨銆? * 鍥犳浼犺繘 Register 鍑芥暟鐨勫璞″繀椤绘槸鍏ㄥ眬銆侀潤鎬佹垨闀挎湡瀛樺湪鐨勪换鍔′笂涓嬫枃鎴愬憳銆? */
 
-/* 把大端格式的两个字节还原成 int16_t，DJI 反馈和控制帧都使用这种顺序。 */
+/* 鎶婂ぇ绔牸寮忕殑涓や釜瀛楄妭杩樺師鎴?int16_t锛孌JI 鍙嶉鍜屾帶鍒跺抚閮戒娇鐢ㄨ繖绉嶉『搴忋€?*/
 static int16_t Motor_ReadInt16BE(const uint8_t *data)
 {
     return (int16_t)((uint16_t)((uint16_t)data[0] << 8) | (uint16_t)data[1]);
 }
 
-/* 把小端格式的两个字节还原成 int16_t，LK 状态帧使用这种顺序。 */
+/* 鎶婂皬绔牸寮忕殑涓や釜瀛楄妭杩樺師鎴?int16_t锛孡K 鐘舵€佸抚浣跨敤杩欑椤哄簭銆?*/
 static int16_t Motor_ReadInt16LE(const uint8_t *data)
 {
     return (int16_t)((uint16_t)((uint16_t)data[1] << 8) | (uint16_t)data[0]);
 }
 
-/* 把小端格式的两个字节还原成 uint16_t，用来解析 LK 单圈编码器值。 */
+/* 鎶婂皬绔牸寮忕殑涓や釜瀛楄妭杩樺師鎴?uint16_t锛岀敤鏉ヨВ鏋?LK 鍗曞湀缂栫爜鍣ㄥ€笺€?*/
 static uint16_t Motor_ReadUint16LE(const uint8_t *data)
 {
     return (uint16_t)((uint16_t)((uint16_t)data[1] << 8) | (uint16_t)data[0]);
 }
 
-/* 把 int16_t 拆成高字节在前、低字节在后的格式。 */
+/* 鎶?int16_t 鎷嗘垚楂樺瓧鑺傚湪鍓嶃€佷綆瀛楄妭鍦ㄥ悗鐨勬牸寮忋€?*/
 static void Motor_WriteInt16BE(uint8_t *data, uint8_t slot, int16_t value)
 {
     uint8_t index;
@@ -83,14 +68,14 @@ static void Motor_WriteInt16BE(uint8_t *data, uint8_t slot, int16_t value)
     data[index + 1U] = (uint8_t)((uint16_t)value & 0xFFU);
 }
 
-/* LK 控制命令里 iq 给定值放在 data[4]/data[5]，采用小端格式。 */
+/* LK 鎺у埗鍛戒护閲?iq 缁欏畾鍊兼斁鍦?data[4]/data[5]锛岄噰鐢ㄥ皬绔牸寮忋€?*/
 static void Motor_WriteInt16LE(uint8_t *data, uint8_t index, int16_t value)
 {
     data[index] = (uint8_t)((uint16_t)value & 0xFFU);
     data[index + 1U] = (uint8_t)((uint16_t)value >> 8);
 }
 
-/* HAL CAN 的标准数据帧发送封装，所有 motor 层发送最终都走这里。 */
+/* HAL CAN 鐨勬爣鍑嗘暟鎹抚鍙戦€佸皝瑁咃紝鎵€鏈?motor 灞傚彂閫佹渶缁堥兘璧拌繖閲屻€?*/
 static HAL_StatusTypeDef Motor_SendStdFrame(CAN_HandleTypeDef *hcan,
                                             uint32_t std_id,
                                             const uint8_t data[8])
@@ -115,28 +100,10 @@ static HAL_StatusTypeDef Motor_SendStdFrame(CAN_HandleTypeDef *hcan,
 
 
 /*
- * 旧标准库接口传入的是 CAN1 / CAN2 外设基地址。
- * HAL 发送函数需要 CAN_HandleTypeDef，这里把外设基地址映射回 CubeMX 生成的句柄。
- */
-static CAN_HandleTypeDef *Motor_ResolveCanHandle(CAN_TypeDef *CANx)
-{
-    if (CANx == CAN1)
-    {
-        return &hcan1;
-    }
-
-    if (CANx == CAN2)
-    {
-        return &hcan2;
-    }
-
-    return NULL;
-}
+ * 鏃ф爣鍑嗗簱鎺ュ彛浼犲叆鐨勬槸 CAN1 / CAN2 澶栬鍩哄湴鍧€銆? * HAL 鍙戦€佸嚱鏁伴渶瑕?CAN_HandleTypeDef锛岃繖閲屾妸澶栬鍩哄湴鍧€鏄犲皠鍥?CubeMX 鐢熸垚鐨勫彞鏌勩€? */
 
 /*
- * 注册表不是按 ID 直接下标访问，而是按“CAN 句柄 + StdId”匹配。
- * 这样同一个电机 ID 可以同时出现在 CAN1 和 CAN2 上，互不冲突。
- */
+ * 娉ㄥ唽琛ㄤ笉鏄寜 ID 鐩存帴涓嬫爣璁块棶锛岃€屾槸鎸夆€淐AN 鍙ユ焺 + StdId鈥濆尮閰嶃€? * 杩欐牱鍚屼竴涓數鏈?ID 鍙互鍚屾椂鍑虹幇鍦?CAN1 鍜?CAN2 涓婏紝浜掍笉鍐茬獊銆? */
 static HAL_StatusTypeDef Motor_RegisterGm6020Object(gm6020_service_t *motor)
 {
     uint8_t i;
@@ -166,9 +133,7 @@ static HAL_StatusTypeDef Motor_RegisterGm6020Object(gm6020_service_t *motor)
 }
 
 /*
- * 把 M3508/M2006 对象挂入注册表。
- * 允许重复注册同一个对象，或用新对象覆盖同一路 CAN + 同一反馈 ID 的旧条目。
- */
+ * 鎶?M3508/M2006 瀵硅薄鎸傚叆娉ㄥ唽琛ㄣ€? * 鍏佽閲嶅娉ㄥ唽鍚屼竴涓璞★紝鎴栫敤鏂板璞¤鐩栧悓涓€璺?CAN + 鍚屼竴鍙嶉 ID 鐨勬棫鏉＄洰銆? */
 static HAL_StatusTypeDef Motor_RegisterM3508Object(m3508_service_t *motor)
 {
     uint8_t i;
@@ -198,9 +163,7 @@ static HAL_StatusTypeDef Motor_RegisterM3508Object(m3508_service_t *motor)
 }
 
 /*
- * 把 LK 对象挂入注册表。
- * LK 协议收发共用 0x140 + ID，所以匹配键使用 hcan + std_id。
- */
+ * 鎶?LK 瀵硅薄鎸傚叆娉ㄥ唽琛ㄣ€? * LK 鍗忚鏀跺彂鍏辩敤 0x140 + ID锛屾墍浠ュ尮閰嶉敭浣跨敤 hcan + std_id銆? */
 static HAL_StatusTypeDef Motor_RegisterLkObject(lk_motor_service_t *motor)
 {
     uint8_t i;
@@ -229,7 +192,7 @@ static HAL_StatusTypeDef Motor_RegisterLkObject(lk_motor_service_t *motor)
     return HAL_ERROR;
 }
 
-/* 刷新在线时间戳。这个函数只说明“收到过合法帧”，具体解析由外层完成。 */
+/* 鍒锋柊鍦ㄧ嚎鏃堕棿鎴炽€傝繖涓嚱鏁板彧璇存槑鈥滄敹鍒拌繃鍚堟硶甯р€濓紝鍏蜂綋瑙ｆ瀽鐢卞灞傚畬鎴愩€?*/
 static void Motor_TouchOnline(volatile uint8_t *online, volatile uint32_t *last_update_tick)
 {
     *last_update_tick = HAL_GetTick();
@@ -237,21 +200,16 @@ static void Motor_TouchOnline(volatile uint8_t *online, volatile uint32_t *last_
 }
 
 /*
- * 判断某个时间戳是否仍然有效。
- * HAL_GetTick() 是 uint32_t，直接做无符号减法可以自然处理 tick 回绕。
- */
+ * 鍒ゆ柇鏌愪釜鏃堕棿鎴虫槸鍚︿粛鐒舵湁鏁堛€? * HAL_GetTick() 鏄?uint32_t锛岀洿鎺ュ仛鏃犵鍙峰噺娉曞彲浠ヨ嚜鐒跺鐞?tick 鍥炵粫銆? */
 static uint8_t Motor_IsRecent(uint32_t last_update_tick)
 {
     return (uint8_t)((HAL_GetTick() - last_update_tick) <= MOTOR_ONLINE_TIMEOUT_MS);
 }
 
 /*
- * DJI 编码器跨零处理：
- * - 原始值从 8191 跳到 0 附近，说明正向跨零，实际增量要加 8192；
- * - 原始值从 0 跳到 8191 附近，说明反向跨零，实际增量要减 8192。
- *
- * 这样可以把单圈编码器变成连续角度，方便上层做位置闭环或调试观察。
- */
+ * DJI 缂栫爜鍣ㄨ法闆跺鐞嗭細
+ * - 鍘熷鍊间粠 8191 璺冲埌 0 闄勮繎锛岃鏄庢鍚戣法闆讹紝瀹為檯澧為噺瑕佸姞 8192锛? * - 鍘熷鍊间粠 0 璺冲埌 8191 闄勮繎锛岃鏄庡弽鍚戣法闆讹紝瀹為檯澧為噺瑕佸噺 8192銆? *
+ * 杩欐牱鍙互鎶婂崟鍦堢紪鐮佸櫒鍙樻垚杩炵画瑙掑害锛屾柟渚夸笂灞傚仛浣嶇疆闂幆鎴栬皟璇曡瀵熴€? */
 static void Motor_UpdateDjiFeedback(dji_motor_feedback_t *feedback, const uint8_t data[8])
 {
     uint16_t raw_ecd;
@@ -300,7 +258,7 @@ static void Motor_UpdateDjiFeedback(dji_motor_feedback_t *feedback, const uint8_
     feedback->speed_dps = (float)feedback->speed_rpm * 6.0f;
 }
 
-/* 把通用 DJI 反馈同步到 GM6020 便捷字段，减少上层直接访问 feedback 子结构的麻烦。 */
+/* 鎶婇€氱敤 DJI 鍙嶉鍚屾鍒?GM6020 渚挎嵎瀛楁锛屽噺灏戜笂灞傜洿鎺ヨ闂?feedback 瀛愮粨鏋勭殑楹荤儲銆?*/
 static void Motor_CopyDjiFeedbackToGm6020(gm6020_service_t *motor)
 {
     motor->speed_rpm = motor->feedback.speed_rpm;
@@ -311,7 +269,7 @@ static void Motor_CopyDjiFeedbackToGm6020(gm6020_service_t *motor)
     motor->speed_dps = motor->feedback.speed_dps;
 }
 
-/* 把通用 DJI 反馈同步到 M3508 便捷字段。 */
+/* 鎶婇€氱敤 DJI 鍙嶉鍚屾鍒?M3508 渚挎嵎瀛楁銆?*/
 static void Motor_CopyDjiFeedbackToM3508(m3508_service_t *motor)
 {
     motor->speed_rpm = motor->feedback.speed_rpm;
@@ -323,13 +281,9 @@ static void Motor_CopyDjiFeedbackToM3508(m3508_service_t *motor)
 }
 
 /*
- * LK 状态 2 反馈解析：
- * data[0] = 0x9C 或力矩控制返回的 0xA1；
- * data[1] = 温度；
- * data[2..3] = iq/力矩电流，小端；
- * data[4..5] = 速度，小端；
- * data[6..7] = 单圈编码器，小端。
- */
+ * LK 鐘舵€?2 鍙嶉瑙ｆ瀽锛? * data[0] = 0x9C 鎴栧姏鐭╂帶鍒惰繑鍥炵殑 0xA1锛? * data[1] = 娓╁害锛? * data[2..3] = iq/鍔涚煩鐢垫祦锛屽皬绔紱
+ * data[4..5] = 閫熷害锛屽皬绔紱
+ * data[6..7] = 鍗曞湀缂栫爜鍣紝灏忕銆? */
 static void Motor_UpdateLkState2(lk_motor_service_t *motor, const uint8_t data[8])
 {
     uint16_t raw_ecd;
@@ -377,29 +331,9 @@ static void Motor_UpdateLkState2(lk_motor_service_t *motor, const uint8_t data[8
     motor->total_angle_deg = (float)motor->total_ecd * MOTOR_LK_ENCODER_DEG_PER_TICK;
 }
 
-/* DJI 四电机控制帧的原始发送函数，旧 Set_* 包装也会复用它。 */
-static HAL_StatusTypeDef Motor_SendDjiRawFrame(CAN_HandleTypeDef *hcan,
-                                               uint32_t std_id,
-                                               int16_t output1,
-                                               int16_t output2,
-                                               int16_t output3,
-                                               int16_t output4)
-{
-    uint8_t tx_data[8];
-
-    memset(tx_data, 0, sizeof(tx_data));
-    Motor_WriteInt16BE(tx_data, 0U, output1);
-    Motor_WriteInt16BE(tx_data, 1U, output2);
-    Motor_WriteInt16BE(tx_data, 2U, output3);
-    Motor_WriteInt16BE(tx_data, 3U, output4);
-
-    return Motor_SendStdFrame(hcan, std_id, tx_data);
-}
-
+/* DJI 鍥涚數鏈烘帶鍒跺抚鐨勫師濮嬪彂閫佸嚱鏁帮紝鏃?Set_* 鍖呰涔熶細澶嶇敤瀹冦€?*/
 /*
- * 按电机 ID 自动决定 DJI 控制帧应该走低组还是高组。
- * 传入的四个指针不是强制代表 slot1~slot4，而是根据 motor_id 放到正确字节位。
- */
+ * 鎸夌數鏈?ID 鑷姩鍐冲畾 DJI 鎺у埗甯у簲璇ヨ蛋浣庣粍杩樻槸楂樼粍銆? * 浼犲叆鐨勫洓涓寚閽堜笉鏄己鍒朵唬琛?slot1~slot4锛岃€屾槸鏍规嵁 motor_id 鏀惧埌姝ｇ‘瀛楄妭浣嶃€? */
 static HAL_StatusTypeDef Motor_SendGm6020FrameByMode(gm6020_control_mode_t mode,
                                                      uint32_t low_std_id,
                                                      uint32_t high_std_id,
@@ -428,13 +362,13 @@ static HAL_StatusTypeDef Motor_SendGm6020FrameByMode(gm6020_control_mode_t mode,
 
     for (i = 0U; i < 4U; ++i)
     {
-        /* NULL 表示该控制槽位输出 0。 */
+        /* NULL 琛ㄧず璇ユ帶鍒舵Ы浣嶈緭鍑?0銆?*/
         if (motors[i] == NULL)
         {
             continue;
         }
 
-        /* 保护检查：对象必须有效、ID 范围正确、控制模式匹配。 */
+        /* 淇濇姢妫€鏌ワ細瀵硅薄蹇呴』鏈夋晥銆両D 鑼冨洿姝ｇ‘銆佹帶鍒舵ā寮忓尮閰嶃€?*/
         if ((motors[i]->hcan == NULL)
          || (motors[i]->motor_id < 1U)
          || (motors[i]->motor_id > 8U)
@@ -445,18 +379,18 @@ static HAL_StatusTypeDef Motor_SendGm6020FrameByMode(gm6020_control_mode_t mode,
 
         if (hcan == NULL)
         {
-            /* 第一台有效电机决定本帧使用哪一路 CAN、低组还是高组。 */
+            /* 绗竴鍙版湁鏁堢數鏈哄喅瀹氭湰甯т娇鐢ㄥ摢涓€璺?CAN銆佷綆缁勮繕鏄珮缁勩€?*/
             hcan = motors[i]->hcan;
             high_group = (uint8_t)((motors[i]->motor_id >= 5U) ? 1U : 0U);
         }
         else if ((hcan != motors[i]->hcan)
               || (high_group != (uint8_t)((motors[i]->motor_id >= 5U) ? 1U : 0U)))
         {
-            /* 同一帧不能混发不同 CAN 或不同 ID 分组。 */
+            /* 鍚屼竴甯т笉鑳芥贩鍙戜笉鍚?CAN 鎴栦笉鍚?ID 鍒嗙粍銆?*/
             return HAL_ERROR;
         }
 
-        /* ID1/5 放 slot0，ID2/6 放 slot1，以此类推。 */
+        /* ID1/5 鏀?slot0锛孖D2/6 鏀?slot1锛屼互姝ょ被鎺ㄣ€?*/
         slot = (uint8_t)((motors[i]->motor_id - 1U) % 4U);
         Motor_WriteInt16BE(tx_data, slot, motors[i]->output);
         have_motor = 1U;
@@ -471,7 +405,7 @@ static HAL_StatusTypeDef Motor_SendGm6020FrameByMode(gm6020_control_mode_t mode,
     return Motor_SendStdFrame(hcan, std_id, tx_data);
 }
 
-/* M3508/C620/C610 的分组规则与 GM6020 类似，但控制帧 ID 不同。 */
+/* M3508/C620/C610 鐨勫垎缁勮鍒欎笌 GM6020 绫讳技锛屼絾鎺у埗甯?ID 涓嶅悓銆?*/
 static HAL_StatusTypeDef Motor_SendM3508FrameById(const m3508_service_t *motor1,
                                                   const m3508_service_t *motor2,
                                                   const m3508_service_t *motor3,
@@ -497,13 +431,13 @@ static HAL_StatusTypeDef Motor_SendM3508FrameById(const m3508_service_t *motor1,
 
     for (i = 0U; i < 4U; ++i)
     {
-        /* NULL 表示该控制槽位输出 0。 */
+        /* NULL 琛ㄧず璇ユ帶鍒舵Ы浣嶈緭鍑?0銆?*/
         if (motors[i] == NULL)
         {
             continue;
         }
 
-        /* M3508/M2006 的有效 ID 范围是 1~8。 */
+        /* M3508/M2006 鐨勬湁鏁?ID 鑼冨洿鏄?1~8銆?*/
         if ((motors[i]->hcan == NULL)
          || (motors[i]->motor_id < 1U)
          || (motors[i]->motor_id > 8U))
@@ -513,18 +447,18 @@ static HAL_StatusTypeDef Motor_SendM3508FrameById(const m3508_service_t *motor1,
 
         if (hcan == NULL)
         {
-            /* 第一台有效电机决定本帧使用哪一路 CAN、低组还是高组。 */
+            /* 绗竴鍙版湁鏁堢數鏈哄喅瀹氭湰甯т娇鐢ㄥ摢涓€璺?CAN銆佷綆缁勮繕鏄珮缁勩€?*/
             hcan = motors[i]->hcan;
             high_group = (uint8_t)((motors[i]->motor_id >= 5U) ? 1U : 0U);
         }
         else if ((hcan != motors[i]->hcan)
               || (high_group != (uint8_t)((motors[i]->motor_id >= 5U) ? 1U : 0U)))
         {
-            /* 同一帧不能混发不同 CAN 或不同 ID 分组。 */
+            /* 鍚屼竴甯т笉鑳芥贩鍙戜笉鍚?CAN 鎴栦笉鍚?ID 鍒嗙粍銆?*/
             return HAL_ERROR;
         }
 
-        /* ID1/5 放 slot0，ID2/6 放 slot1，以此类推。 */
+        /* ID1/5 鏀?slot0锛孖D2/6 鏀?slot1锛屼互姝ょ被鎺ㄣ€?*/
         slot = (uint8_t)((motors[i]->motor_id - 1U) % 4U);
         Motor_WriteInt16BE(tx_data, slot, motors[i]->output);
         have_motor = 1U;
@@ -540,9 +474,7 @@ static HAL_StatusTypeDef Motor_SendM3508FrameById(const m3508_service_t *motor1,
 }
 
 /*
- * 清空三类电机注册表。
- * 该函数通常在 BSP 初始化阶段调用一次，之后由控制任务/发射任务重新注册电机。
- */
+ * 娓呯┖涓夌被鐢垫満娉ㄥ唽琛ㄣ€? * 璇ュ嚱鏁伴€氬父鍦?BSP 鍒濆鍖栭樁娈佃皟鐢ㄤ竴娆★紝涔嬪悗鐢辨帶鍒朵换鍔?鍙戝皠浠诲姟閲嶆柊娉ㄥ唽鐢垫満銆? */
 void Motor_Init(void)
 {
     memset(gm6020_registry, 0, sizeof(gm6020_registry));
@@ -551,9 +483,7 @@ void Motor_Init(void)
 }
 
 /*
- * 注册 GM6020 电流环对象。
- * ID1 的反馈帧是 0x205，后续 ID 依次递增。
- */
+ * 娉ㄥ唽 GM6020 鐢垫祦鐜璞°€? * ID1 鐨勫弽棣堝抚鏄?0x205锛屽悗缁?ID 渚濇閫掑銆? */
 HAL_StatusTypeDef Motor_RegisterGm6020CurrentLoop(gm6020_service_t *motor,
                                                    CAN_HandleTypeDef *hcan,
                                                    uint8_t motor_id)
@@ -573,9 +503,7 @@ HAL_StatusTypeDef Motor_RegisterGm6020CurrentLoop(gm6020_service_t *motor,
 }
 
 /*
- * 注册 GM6020 电压环对象。
- * 反馈解析与电流环一致，区别只在发送时使用电压控制帧 ID。
- */
+ * 娉ㄥ唽 GM6020 鐢靛帇鐜璞°€? * 鍙嶉瑙ｆ瀽涓庣數娴佺幆涓€鑷达紝鍖哄埆鍙湪鍙戦€佹椂浣跨敤鐢靛帇鎺у埗甯?ID銆? */
 HAL_StatusTypeDef Motor_RegisterGm6020VoltageLoop(gm6020_service_t *motor,
                                                    CAN_HandleTypeDef *hcan,
                                                    uint8_t motor_id)
@@ -594,7 +522,7 @@ HAL_StatusTypeDef Motor_RegisterGm6020VoltageLoop(gm6020_service_t *motor,
     return Motor_RegisterGm6020Object(motor);
 }
 
-/* 缓存 GM6020 电流环输出，不立即发送 CAN。 */
+/* 缂撳瓨 GM6020 鐢垫祦鐜緭鍑猴紝涓嶇珛鍗冲彂閫?CAN銆?*/
 void Motor_SetGm6020CurrentLoopOutput(gm6020_service_t *motor, int16_t output)
 {
     if ((motor != NULL) && (motor->control_mode == MOTOR_GM6020_CONTROL_CURRENT))
@@ -603,7 +531,7 @@ void Motor_SetGm6020CurrentLoopOutput(gm6020_service_t *motor, int16_t output)
     }
 }
 
-/* 缓存 GM6020 电压环输出，不立即发送 CAN。 */
+/* 缂撳瓨 GM6020 鐢靛帇鐜緭鍑猴紝涓嶇珛鍗冲彂閫?CAN銆?*/
 void Motor_SetGm6020VoltageLoopOutput(gm6020_service_t *motor, int16_t output)
 {
     if ((motor != NULL) && (motor->control_mode == MOTOR_GM6020_CONTROL_VOLTAGE))
@@ -613,9 +541,7 @@ void Motor_SetGm6020VoltageLoopOutput(gm6020_service_t *motor, int16_t output)
 }
 
 /*
- * 发送 GM6020 电流环控制帧。
- * 传入的电机必须属于同一路 CAN 和同一 ID 分组。
- */
+ * 鍙戦€?GM6020 鐢垫祦鐜帶鍒跺抚銆? * 浼犲叆鐨勭數鏈哄繀椤诲睘浜庡悓涓€璺?CAN 鍜屽悓涓€ ID 鍒嗙粍銆? */
 HAL_StatusTypeDef Motor_SendGm6020CurrentLoopFrame(const gm6020_service_t *motor1,
                                                    const gm6020_service_t *motor2,
                                                    const gm6020_service_t *motor3,
@@ -631,9 +557,7 @@ HAL_StatusTypeDef Motor_SendGm6020CurrentLoopFrame(const gm6020_service_t *motor
 }
 
 /*
- * 发送 GM6020 电压环控制帧。
- * 分组规则和电流环相同，只是控制 StdId 不同。
- */
+ * 鍙戦€?GM6020 鐢靛帇鐜帶鍒跺抚銆? * 鍒嗙粍瑙勫垯鍜岀數娴佺幆鐩稿悓锛屽彧鏄帶鍒?StdId 涓嶅悓銆? */
 HAL_StatusTypeDef Motor_SendGm6020VoltageLoopFrame(const gm6020_service_t *motor1,
                                                    const gm6020_service_t *motor2,
                                                    const gm6020_service_t *motor3,
@@ -648,7 +572,7 @@ HAL_StatusTypeDef Motor_SendGm6020VoltageLoopFrame(const gm6020_service_t *motor
                                        motor4);
 }
 
-/* 返回 GM6020 在线状态，超过超时时间未刷新则返回 0。 */
+/* 杩斿洖 GM6020 鍦ㄧ嚎鐘舵€侊紝瓒呰繃瓒呮椂鏃堕棿鏈埛鏂板垯杩斿洖 0銆?*/
 uint8_t Motor_Gm6020IsOnline(const gm6020_service_t *motor)
 {
     if ((motor == NULL) || (motor->online == 0U))
@@ -660,9 +584,7 @@ uint8_t Motor_Gm6020IsOnline(const gm6020_service_t *motor)
 }
 
 /*
- * 注册 M3508/M2006 电流环对象。
- * ID1 的反馈帧是 0x201，ID8 的反馈帧是 0x208。
- */
+ * 娉ㄥ唽 M3508/M2006 鐢垫祦鐜璞°€? * ID1 鐨勫弽棣堝抚鏄?0x201锛孖D8 鐨勫弽棣堝抚鏄?0x208銆? */
 HAL_StatusTypeDef Motor_RegisterM3508CurrentLoop(m3508_service_t *motor,
                                                   CAN_HandleTypeDef *hcan,
                                                   uint8_t motor_id)
@@ -680,7 +602,7 @@ HAL_StatusTypeDef Motor_RegisterM3508CurrentLoop(m3508_service_t *motor,
     return Motor_RegisterM3508Object(motor);
 }
 
-/* 缓存 M3508/M2006 电流环输出，不立即发送 CAN。 */
+/* 缂撳瓨 M3508/M2006 鐢垫祦鐜緭鍑猴紝涓嶇珛鍗冲彂閫?CAN銆?*/
 void Motor_SetM3508CurrentLoopOutput(m3508_service_t *motor, int16_t output)
 {
     if (motor != NULL)
@@ -689,7 +611,7 @@ void Motor_SetM3508CurrentLoopOutput(m3508_service_t *motor, int16_t output)
     }
 }
 
-/* 发送一帧 M3508/M2006 电流环控制帧。 */
+/* 鍙戦€佷竴甯?M3508/M2006 鐢垫祦鐜帶鍒跺抚銆?*/
 HAL_StatusTypeDef Motor_SendM3508CurrentLoopFrame(const m3508_service_t *motor1,
                                                   const m3508_service_t *motor2,
                                                   const m3508_service_t *motor3,
@@ -698,7 +620,7 @@ HAL_StatusTypeDef Motor_SendM3508CurrentLoopFrame(const m3508_service_t *motor1,
     return Motor_SendM3508FrameById(motor1, motor2, motor3, motor4);
 }
 
-/* 返回 M3508/M2006 在线状态。 */
+/* 杩斿洖 M3508/M2006 鍦ㄧ嚎鐘舵€併€?*/
 uint8_t Motor_M3508IsOnline(const m3508_service_t *motor)
 {
     if ((motor == NULL) || (motor->online == 0U))
@@ -710,9 +632,7 @@ uint8_t Motor_M3508IsOnline(const m3508_service_t *motor)
 }
 
 /*
- * 注册 LK/RMD 电机。
- * 标准帧 ID = 0x140 + motor_id，例如 ID5 对应 0x145。
- */
+ * 娉ㄥ唽 LK/RMD 鐢垫満銆? * 鏍囧噯甯?ID = 0x140 + motor_id锛屼緥濡?ID5 瀵瑰簲 0x145銆? */
 HAL_StatusTypeDef Motor_RegisterLk(lk_motor_service_t *motor,
                                     CAN_HandleTypeDef *hcan,
                                     uint8_t motor_id)
@@ -730,7 +650,7 @@ HAL_StatusTypeDef Motor_RegisterLk(lk_motor_service_t *motor,
     return Motor_RegisterLkObject(motor);
 }
 
-/* 缓存 LK iq/力矩输出，不立即发送 CAN。 */
+/* 缂撳瓨 LK iq/鍔涚煩杈撳嚭锛屼笉绔嬪嵆鍙戦€?CAN銆?*/
 void Motor_SetLkIqOutput(lk_motor_service_t *motor, int16_t output)
 {
     if (motor != NULL)
@@ -739,7 +659,7 @@ void Motor_SetLkIqOutput(lk_motor_service_t *motor, int16_t output)
     }
 }
 
-/* 发送 LK 上电/使能命令 0x88。 */
+/* 鍙戦€?LK 涓婄數/浣胯兘鍛戒护 0x88銆?*/
 HAL_StatusTypeDef Motor_LkSendPowerOn(lk_motor_service_t *motor)
 {
     HAL_StatusTypeDef status;
@@ -761,7 +681,7 @@ HAL_StatusTypeDef Motor_LkSendPowerOn(lk_motor_service_t *motor)
     return status;
 }
 
-/* 发送 LK 停止命令 0x81。 */
+/* 鍙戦€?LK 鍋滄鍛戒护 0x81銆?*/
 HAL_StatusTypeDef Motor_LkSendStop(lk_motor_service_t *motor)
 {
     HAL_StatusTypeDef status;
@@ -783,7 +703,7 @@ HAL_StatusTypeDef Motor_LkSendStop(lk_motor_service_t *motor)
     return status;
 }
 
-/* 发送 LK 状态 2 查询命令 0x9C，用于刷新温度、速度、电流和编码器。 */
+/* 鍙戦€?LK 鐘舵€?2 鏌ヨ鍛戒护 0x9C锛岀敤浜庡埛鏂版俯搴︺€侀€熷害銆佺數娴佸拰缂栫爜鍣ㄣ€?*/
 HAL_StatusTypeDef Motor_LkSendReadState2Request(lk_motor_service_t *motor)
 {
     uint8_t tx_data[8];
@@ -799,7 +719,7 @@ HAL_StatusTypeDef Motor_LkSendReadState2Request(lk_motor_service_t *motor)
     return Motor_SendStdFrame(motor->hcan, motor->std_id, tx_data);
 }
 
-/* 发送 LK iq/力矩控制命令 0xA1。 */
+/* 鍙戦€?LK iq/鍔涚煩鎺у埗鍛戒护 0xA1銆?*/
 HAL_StatusTypeDef Motor_LkSendIqControl(lk_motor_service_t *motor)
 {
     HAL_StatusTypeDef status;
@@ -823,7 +743,7 @@ HAL_StatusTypeDef Motor_LkSendIqControl(lk_motor_service_t *motor)
     return status;
 }
 
-/* 返回 LK 在线状态。 */
+/* 杩斿洖 LK 鍦ㄧ嚎鐘舵€併€?*/
 uint8_t Motor_LkIsOnline(const lk_motor_service_t *motor)
 {
     if ((motor == NULL) || (motor->online == 0U))
@@ -835,9 +755,7 @@ uint8_t Motor_LkIsOnline(const lk_motor_service_t *motor)
 }
 
 /*
- * 处理并分发一帧 CAN 接收数据。
- * BSP 的 CAN FIFO 回调会把 HAL 读出的 rx_header/rx_data 传进来。
- */
+ * 澶勭悊骞跺垎鍙戜竴甯?CAN 鎺ユ敹鏁版嵁銆? * BSP 鐨?CAN FIFO 鍥炶皟浼氭妸 HAL 璇诲嚭鐨?rx_header/rx_data 浼犺繘鏉ャ€? */
 void Motor_ProcessCanMessage(CAN_HandleTypeDef *hcan,
                              const CAN_RxHeaderTypeDef *rx_header,
                              const uint8_t rx_data[8])
@@ -909,94 +827,4 @@ void Motor_ProcessCanMessage(CAN_HandleTypeDef *hcan,
             return;
         }
     }
-}
-
-void Set_GM6020_IQ1(CAN_TypeDef *CANx,
-                    int16_t motor1_iq,
-                    int16_t motor2_iq,
-                    int16_t motor3_iq,
-                    int16_t motor4_iq)
-{
-    /* 兼容旧接口：GM6020 ID1~ID4 电压控制帧，StdId = 0x1FF。 */
-    (void)Motor_SendDjiRawFrame(Motor_ResolveCanHandle(CANx),
-                                MOTOR_DJI_GM6020_VOLTAGE_CMD_LOW,
-                                motor1_iq,
-                                motor2_iq,
-                                motor3_iq,
-                                motor4_iq);
-}
-
-void Set_GM6020_IQ2(CAN_TypeDef *CANx,
-                    int16_t motor5_iq,
-                    int16_t motor6_iq,
-                    int16_t motor7_iq,
-                    int16_t motor8_iq)
-{
-    /* 兼容旧接口：GM6020 ID5~ID8 电压控制帧，StdId = 0x2FF。 */
-    (void)Motor_SendDjiRawFrame(Motor_ResolveCanHandle(CANx),
-                                MOTOR_DJI_GM6020_VOLTAGE_CMD_HIGH,
-                                motor5_iq,
-                                motor6_iq,
-                                motor7_iq,
-                                motor8_iq);
-}
-
-void Set_GM6020_Current_IQ1(CAN_TypeDef *CANx,
-                            int16_t motor1_iq,
-                            int16_t motor2_iq,
-                            int16_t motor3_iq,
-                            int16_t motor4_iq)
-{
-    /* 兼容旧接口：GM6020 ID1~ID4 电流控制帧，StdId = 0x1FE。 */
-    (void)Motor_SendDjiRawFrame(Motor_ResolveCanHandle(CANx),
-                                MOTOR_DJI_GM6020_CURRENT_CMD_LOW,
-                                motor1_iq,
-                                motor2_iq,
-                                motor3_iq,
-                                motor4_iq);
-}
-
-void Set_GM6020_Current_IQ2(CAN_TypeDef *CANx,
-                            int16_t motor5_iq,
-                            int16_t motor6_iq,
-                            int16_t motor7_iq,
-                            int16_t motor8_iq)
-{
-    /* 兼容旧接口：GM6020 ID5~ID8 电流控制帧，StdId = 0x2FE。 */
-    (void)Motor_SendDjiRawFrame(Motor_ResolveCanHandle(CANx),
-                                MOTOR_DJI_GM6020_CURRENT_CMD_HIGH,
-                                motor5_iq,
-                                motor6_iq,
-                                motor7_iq,
-                                motor8_iq);
-}
-
-void Set_C620andC610_IQ1(CAN_TypeDef *CANx,
-                         int16_t motor1_iq,
-                         int16_t motor2_iq,
-                         int16_t motor3_iq,
-                         int16_t motor4_iq)
-{
-    /* 兼容旧接口：C620/C610 ID1~ID4 电流控制帧，StdId = 0x200。 */
-    (void)Motor_SendDjiRawFrame(Motor_ResolveCanHandle(CANx),
-                                MOTOR_DJI_M3508_CMD_LOW,
-                                motor1_iq,
-                                motor2_iq,
-                                motor3_iq,
-                                motor4_iq);
-}
-
-void Set_C620andC610_IQ2(CAN_TypeDef *CANx,
-                         int16_t motor5_iq,
-                         int16_t motor6_iq,
-                         int16_t motor7_iq,
-                         int16_t motor8_iq)
-{
-    /* 兼容旧接口：C620/C610 ID5~ID8 电流控制帧，StdId = 0x1FF。 */
-    (void)Motor_SendDjiRawFrame(Motor_ResolveCanHandle(CANx),
-                                MOTOR_DJI_M3508_CMD_HIGH,
-                                motor5_iq,
-                                motor6_iq,
-                                motor7_iq,
-                                motor8_iq);
 }

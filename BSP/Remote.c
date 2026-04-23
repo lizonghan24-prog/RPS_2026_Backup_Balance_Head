@@ -7,12 +7,13 @@
 #define REMOTE_CRC_OFFSET       19U
 #define REMOTE_ONLINE_TIMEOUT   100U
 
-static remote_state_t remote_state_data;
+remote_state_t remote_state_data;
 static uint8_t remote_rx_cache[REMOTE_FRAME_LEN];
 static uint16_t remote_rx_cache_len;
 
 /* VT03/VT13 的遥控帧使用 CRC16-CCITT-FALSE。 */
-static uint16_t Remote_Crc16CcittFalse(const uint8_t *data, uint16_t length)
+/* Match VTM remote CRC: reflected CRC16 (poly 0x8408, init 0xFFFF). */
+static uint16_t Remote_Crc16Vtm(const uint8_t *data, uint16_t length)
 {
     uint16_t crc;
     uint16_t i;
@@ -21,16 +22,16 @@ static uint16_t Remote_Crc16CcittFalse(const uint8_t *data, uint16_t length)
     crc = 0xFFFFU;
     for (i = 0U; i < length; ++i)
     {
-        crc ^= (uint16_t)data[i] << 8;
+        crc ^= (uint16_t)data[i];
         for (j = 0U; j < 8U; ++j)
         {
-            if ((crc & 0x8000U) != 0U)
+            if ((crc & 0x0001U) != 0U)
             {
-                crc = (uint16_t)((crc << 1) ^ 0x1021U);
+                crc = (uint16_t)((crc >> 1) ^ 0x8408U);
             }
             else
             {
-                crc <<= 1;
+                crc >>= 1;
             }
         }
     }
@@ -72,19 +73,17 @@ static void Remote_ShiftCacheLeft(uint16_t shift)
 }
 
 /* 有些资料里 CRC 高低字节顺序不一致，这里两种都兼容。 */
+/* CRC layout follows VTM frame: low byte first, high byte second. */
 static uint8_t Remote_FrameValid(const uint8_t *frame)
 {
     uint16_t calc_crc;
     uint16_t frame_crc_le;
-    uint16_t frame_crc_be;
 
-    calc_crc = Remote_Crc16CcittFalse(frame, REMOTE_CRC_OFFSET);
+    calc_crc = Remote_Crc16Vtm(frame, REMOTE_CRC_OFFSET);
     frame_crc_le = (uint16_t)frame[REMOTE_CRC_OFFSET]
                  | ((uint16_t)frame[REMOTE_CRC_OFFSET + 1U] << 8);
-    frame_crc_be = ((uint16_t)frame[REMOTE_CRC_OFFSET] << 8)
-                 | (uint16_t)frame[REMOTE_CRC_OFFSET + 1U];
 
-    return (uint8_t)((calc_crc == frame_crc_le) || (calc_crc == frame_crc_be));
+    return (uint8_t)(calc_crc == frame_crc_le);
 }
 
 /* 把 21 字节遥控帧拆成结构化状态。 */
@@ -115,9 +114,9 @@ static void Remote_DecodeFrame(const uint8_t *frame)
     remote_state_data.mouse_x = (int16_t)Remote_ExtractBitsLE(frame, 80U, 16U);
     remote_state_data.mouse_y = (int16_t)Remote_ExtractBitsLE(frame, 96U, 16U);
     remote_state_data.mouse_z = (int16_t)Remote_ExtractBitsLE(frame, 112U, 16U);
-    remote_state_data.mouse_left_pressed = (uint8_t)(Remote_ExtractBitsLE(frame, 128U, 2U) & 0x01U);
-    remote_state_data.mouse_right_pressed = (uint8_t)(Remote_ExtractBitsLE(frame, 130U, 2U) & 0x01U);
-    remote_state_data.mouse_middle_pressed = (uint8_t)(Remote_ExtractBitsLE(frame, 132U, 2U) & 0x01U);
+    remote_state_data.mouse_left_pressed = (uint8_t)(Remote_ExtractBitsLE(frame, 128U, 2U) != 0U);
+    remote_state_data.mouse_right_pressed = (uint8_t)(Remote_ExtractBitsLE(frame, 130U, 2U) != 0U);
+    remote_state_data.mouse_middle_pressed = (uint8_t)(Remote_ExtractBitsLE(frame, 132U, 2U) != 0U);
     remote_state_data.keyboard = (uint16_t)Remote_ExtractBitsLE(frame, 136U, 16U);
 
     remote_state_data.online = 1U;
@@ -147,8 +146,8 @@ static void Remote_TryDecodeCache(void)
         if (Remote_FrameValid(remote_rx_cache) != 0U)
         {
             Remote_DecodeFrame(remote_rx_cache);
-            remote_rx_cache_len = 0U;
-            return;
+            Remote_ShiftCacheLeft(REMOTE_FRAME_LEN);
+            continue;
         }
 
         Remote_ShiftCacheLeft(1U);

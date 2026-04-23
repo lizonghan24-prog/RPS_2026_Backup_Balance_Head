@@ -59,6 +59,7 @@
 extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 extern TIM_HandleTypeDef htim6;
+extern DMA_HandleTypeDef hdma_uart5_rx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
 extern DMA_HandleTypeDef hdma_usart2_tx;
 extern DMA_HandleTypeDef hdma_usart3_rx;
@@ -212,6 +213,20 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles DMA1 stream0 global interrupt.
+  */
+void DMA1_Stream0_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Stream0_IRQn 0 */
+
+  /* USER CODE END DMA1_Stream0_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_uart5_rx);
+  /* USER CODE BEGIN DMA1_Stream0_IRQn 1 */
+
+  /* USER CODE END DMA1_Stream0_IRQn 1 */
+}
+
+/**
   * @brief This function handles DMA1 stream1 global interrupt.
   */
 void DMA1_Stream1_IRQHandler(void)
@@ -301,7 +316,7 @@ void USART2_IRQHandler(void)
 void USART3_IRQHandler(void)
 {
   /* USER CODE BEGIN USART3_IRQn 0 */
-  /* USART3 接 IMU，这里在 HAL 处理中断前先搬运空闲段数据。 */
+  /* USART3 当前不再作为遥控/IMU 通道，保留入口以兼容旧串口配置。 */
   BSP_HandleUartIdle(&huart3);
 
   /* USER CODE END USART3_IRQn 0 */
@@ -331,6 +346,9 @@ void UART4_IRQHandler(void)
 void UART5_IRQHandler(void)
 {
   /* USER CODE BEGIN UART5_IRQn 0 */
+  BSP_HandleUartIdle(&huart5);
+
+  /* UART5 接图传遥控，DMA 数据由主循环 BSP_Poll() 主动搬运。 */
 
   /* USER CODE END UART5_IRQn 0 */
   HAL_UART_IRQHandler(&huart5);
@@ -387,7 +405,7 @@ void CAN2_RX0_IRQHandler(void)
 void USART6_IRQHandler(void)
 {
   /* USER CODE BEGIN USART6_IRQn 0 */
-  /* USART6 接图传遥控，这里在 HAL 处理中断前先搬运空闲段数据。 */
+  /* USART6 接 IMU，这里在 HAL 处理中断前先搬运空闲段数据。 */
   BSP_HandleUartIdle(&huart6);
 
   /* USER CODE END USART6_IRQn 0 */

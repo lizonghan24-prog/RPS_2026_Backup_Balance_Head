@@ -2,13 +2,13 @@
 
 #include <string.h>
 
-extern UART_HandleTypeDef huart3;
+extern UART_HandleTypeDef huart6;
 
 #define IMU_RX_CACHE_SIZE      256U
 #define IMU_FRAME_OVERHEAD     6U
 #define IMU_ONLINE_TIMEOUT     50U
 
-static imu_hi91_t imu_state;
+imu_hi91_t imu_state;
 static uint8_t imu_rx_cache[IMU_RX_CACHE_SIZE];
 static uint16_t imu_rx_cache_len;
 
@@ -230,7 +230,7 @@ HAL_StatusTypeDef IMU_SendCommand(const char *command)
         tx_buffer[length++] = '\n';
     }
 
-    return HAL_UART_Transmit(&huart3, (uint8_t *)tx_buffer, (uint16_t)length, 100U);
+    return HAL_UART_Transmit(&huart6, (uint8_t *)tx_buffer, (uint16_t)length, 100U);
 }
 
 void IMU_SendRecommendedConfig(void)

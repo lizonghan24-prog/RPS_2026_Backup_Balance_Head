@@ -16,15 +16,15 @@ extern "C" {
 #endif
 
 /*
- * CANBus_Task 是旧工程里 CAN 收发任务的兼容入口。
+ * 
  *
  * 当前工程的 HAL 接收链路是：
  * HAL_CAN_RxFifo0MsgPendingCallback()
  * -> HAL_CAN_GetRxMessage()
  * -> Motor_ProcessCanMessage()
  *
- * 如果后续想把 CAN 分发重新集中到 CANBus_Task，也可以在 HAL 回调里调用
- * CANBus_Task_ProcessRxMessage()，本文件会继续把电机反馈交给 motor 层解析。
+ * 如果后续把 CAN 分发重新集中到 CANBus_Task，在 HAL 回调里调用
+ * 继续把电机反馈交给 motor 层解析
  */
 
 /* ========================= 旧工程保留的标准帧 ID 宏 ========================= */
@@ -98,7 +98,7 @@ HAL_StatusTypeDef CANBus_Task_SendStdFrame(CAN_HandleTypeDef *hcan,
                                            const uint8_t tx_data[8]);
 
 /*
- * 旧工程里的总发送任务入口。
+
  *
  * 当前工程的云台/发射 CAN 输出已经分别在 Control_Task / Shoot_Task 中完成，
  * 所以这里默认不发送任何帧，只保留函数名保证旧调度代码可以链接。

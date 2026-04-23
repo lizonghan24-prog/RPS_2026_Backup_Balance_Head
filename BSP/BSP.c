@@ -7,7 +7,7 @@
 extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 extern TIM_HandleTypeDef htim6;
-extern UART_HandleTypeDef huart3;
+extern UART_HandleTypeDef huart5;
 extern UART_HandleTypeDef huart6;
 
 #define BSP_IMU_DMA_BUFFER_SIZE       256U
@@ -234,15 +234,15 @@ void BSP_Init(void)
     IMU_Init();
     Motor_Init();
 
-    /* USART3 给 IMU，缓存稍大一点，避免 1 kHz 数据堆积。 */
+    /* USART6 给 IMU，缓存稍大一点，避免 1 kHz 数据堆积。 */
     BSP_RingInit(&imu_uart_channel.ring, imu_ring_storage, BSP_IMU_RING_BUFFER_SIZE);
-    imu_uart_channel.huart = &huart3;
+    imu_uart_channel.huart = &huart6;
     imu_uart_channel.dma_buffer = imu_dma_buffer;
     imu_uart_channel.dma_buffer_size = BSP_IMU_DMA_BUFFER_SIZE;
 
-    /* USART6 给图传遥控，缓存可以相对小一些。 */
+    /* UART5 给图传遥控，缓存可以相对小一些。 */
     BSP_RingInit(&remote_uart_channel.ring, remote_ring_storage, BSP_REMOTE_RING_BUFFER_SIZE);
-    remote_uart_channel.huart = &huart6;
+    remote_uart_channel.huart = &huart5;
     remote_uart_channel.dma_buffer = remote_dma_buffer;
     remote_uart_channel.dma_buffer_size = BSP_REMOTE_DMA_BUFFER_SIZE;
 
@@ -261,7 +261,13 @@ void BSP_Init(void)
 
 void BSP_Poll(void)
 {
-    /* 主循环只做“取数据并分发”，不直接碰 DMA 计数器。 */
+    /*
+     * 主循环先主动搬运 DMA 新数据，再从环形缓冲分发。
+     * 这样 UART5 不需要在 CubeMX 生成的中断函数里额外加空闲中断搬运代码。
+     */
+    BSP_MoveDmaToRing(&imu_uart_channel);
+    BSP_MoveDmaToRing(&remote_uart_channel);
+
     BSP_PollSerialChannel(&imu_uart_channel, imu_poll_buffer, sizeof(imu_poll_buffer), IMU_Process);
     BSP_PollSerialChannel(&remote_uart_channel, remote_poll_buffer, sizeof(remote_poll_buffer), Remote_Process);
 }

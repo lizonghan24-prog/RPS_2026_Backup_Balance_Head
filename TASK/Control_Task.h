@@ -26,17 +26,22 @@ extern CAN_HandleTypeDef hcan2;
 #define CONTROL_PITCH_MOTOR_ID                      1U
 /* Yaw 轴当前使用 CAN2 上的 ID1 GM6020，按电流环方式控制。 */
 #define CONTROL_YAW_MOTOR_CAN                       (&hcan2)
-#define CONTROL_YAW_MOTOR_ID                        1U
+#define CONTROL_YAW_MOTOR_ID                        5U
 
-/* ========================= 遥控映射配置区 ========================= */
-/* 图传遥控通道中，默认 ch0 控制 yaw，ch1 控制 pitch。 */
-#define CONTROL_REMOTE_YAW_CHANNEL_INDEX            0U
-#define CONTROL_REMOTE_PITCH_CHANNEL_INDEX          1U
+/* ========================= 遥控 / 键鼠映射配置区 ========================= */
+/* 图传遥控通道映射：ch2 控制 pitch（上下），ch3 控制 yaw（左右）。 */
+#define CONTROL_REMOTE_YAW_CHANNEL_INDEX            3U
+#define CONTROL_REMOTE_PITCH_CHANNEL_INDEX          2U
 /* 遥控输入映射成目标角速度，单位是 deg/s。 */
 #define CONTROL_YAW_REMOTE_SCALE_DEG_PER_S          0.18f
 #define CONTROL_PITCH_REMOTE_SCALE_DEG_PER_S        0.12f
 /* 小于死区的输入直接丢掉，避免摇杆回中附近抖动。 */
 #define CONTROL_REMOTE_DEADBAND                     10
+/* 鼠标输入映射成目标角速度，单位是 deg/s/count；方向反了就改符号。 */
+#define CONTROL_MOUSE_YAW_SCALE_DEG_PER_S           0.05f
+#define CONTROL_MOUSE_PITCH_SCALE_DEG_PER_S        -0.05f
+/* 鼠标小抖动死区。 */
+#define CONTROL_MOUSE_DEADBAND                      1
 
 /* ========================= IMU 映射配置区 ========================= */
 /* IMU 的欧拉角数组默认按 roll、pitch、yaw 排列。 */
@@ -46,36 +51,23 @@ extern CAN_HandleTypeDef hcan2;
 #define CONTROL_IMU_PITCH_RATE_INDEX                1U
 #define CONTROL_IMU_YAW_RATE_INDEX                  2U
 
-/* ========================= 机械限位与回中配置区 ========================= */
+/* ========================= 机械限位配置区 ========================= */
 /* Pitch 轴按机械限位处理，Yaw 轴按回环角处理。 */
 #define CONTROL_PITCH_MIN_DEG                      -25.0f
 #define CONTROL_PITCH_MAX_DEG                       25.0f
-#define CONTROL_PITCH_CENTER_DEG                    0.0f
 #define CONTROL_PITCH_PROTECT_MARGIN_DEG            2.0f
 #define CONTROL_PITCH_WRAP_ENABLE                   0U
 
 #define CONTROL_YAW_MIN_DEG                      -180.0f
 #define CONTROL_YAW_MAX_DEG                       180.0f
-#define CONTROL_YAW_CENTER_DEG                      0.0f
 #define CONTROL_YAW_PROTECT_MARGIN_DEG              0.0f
 #define CONTROL_YAW_WRAP_ENABLE                     1U
 
 /* ========================= 模式映射配置区 ========================= */
-/* 当前约定：C 挡无力，N 挡手动，S 挡回中；暂停键始终强制无力。 */
+/* 当前约定：C 挡无力，N 挡遥控器，S 挡键鼠；暂停键始终强制无力。 */
 #define CONTROL_MODE_GEAR_RELAX                     REMOTE_SWITCH_C
-#define CONTROL_MODE_GEAR_MANUAL                    REMOTE_SWITCH_N
-#define CONTROL_MODE_GEAR_RECENTER                  REMOTE_SWITCH_S
-
-/* ========================= 调试模式配置区 ========================= */
-/* 默认按住右侧自定义键进入调试模式，调试模式下左侧自定义键触发回中。 */
-#define CONTROL_DEBUG_ENABLE_BY_CUSTOM_RIGHT        1U
-#define CONTROL_DEBUG_RECENTER_BY_CUSTOM_LEFT       1U
-#define CONTROL_DEBUG_PITCH_REMOTE_SCALE_RATIO      0.25f
-#define CONTROL_DEBUG_YAW_REMOTE_SCALE_RATIO        0.25f
-#define CONTROL_DEBUG_PITCH_SPEED_LIMIT_DPS         60.0f
-#define CONTROL_DEBUG_YAW_SPEED_LIMIT_DPS           80.0f
-#define CONTROL_DEBUG_PITCH_CURRENT_LIMIT           3000.0f
-#define CONTROL_DEBUG_YAW_CURRENT_LIMIT             3500.0f
+#define CONTROL_MODE_GEAR_REMOTE                    REMOTE_SWITCH_N
+#define CONTROL_MODE_GEAR_KEY_MOUSE                 REMOTE_SWITCH_S
 
 /* ========================= Pitch 轴 PID 配置区 ========================= */
 #define CONTROL_PITCH_ANGLE_KP                      10.0f
@@ -107,10 +99,8 @@ extern CAN_HandleTypeDef hcan2;
 typedef enum
 {
     CONTROL_MODE_RELAX = 0U,                     /* 无力模式，直接下发 0 电流。 */
-    CONTROL_MODE_HOLD = 1U,                      /* 保持模式，锁住当前目标姿态。 */
-    CONTROL_MODE_MANUAL = 2U,                    /* 手动模式，遥控输入积分成目标角。 */
-    CONTROL_MODE_RECENTER = 3U,                  /* 回中模式，把目标角拉回中心。 */
-    CONTROL_MODE_DEBUG = 4U                      /* 调试模式，降低灵敏度和输出上限。 */
+    CONTROL_MODE_REMOTE = 1U,                    /* 遥控器模式，使用摇杆控制云台。 */
+    CONTROL_MODE_KEY_MOUSE = 2U                  /* 键鼠模式，使用鼠标控制云台。 */
 } control_mode_t;
 
 /* 单个云台轴的控制对象。外环控角度，内环控角速度。 */
@@ -125,12 +115,9 @@ typedef struct
     float target_speed_dps;                     /* 外环输出的目标角速度，单位 deg/s。 */
     float target_current;                       /* 内环输出的目标电流。 */
     float remote_scale_deg_per_s;               /* 遥控输入到目标角速度的缩放系数。 */
-    float debug_remote_scale_ratio;             /* 调试模式下额外乘上的灵敏度比例。 */
-    float debug_speed_limit_dps;                /* 调试模式下的角速度限幅。 */
-    float debug_current_limit;                  /* 调试模式下的电流限幅。 */
+    float mouse_scale_deg_per_s;                /* 鼠标输入到目标角速度的缩放系数。 */
     float min_angle_deg;                        /* 角度下限。 */
     float max_angle_deg;                        /* 角度上限。 */
-    float center_angle_deg;                     /* 回中模式使用的目标中心角。 */
     float protect_margin_deg;                   /* 触发机械限位保护时额外预留的裕量。 */
     uint8_t wrap_enable;                        /* 1 表示按回环角计算误差，0 表示按普通角度处理。 */
     uint8_t limit_active;                       /* 当前是否处于限位保护状态。 */
@@ -166,5 +153,8 @@ void Control_Task_Init(void);
  * 本函数会读取最新 IMU / 遥控状态，完成模式判断、双环 PID 和 CAN 输出。
  */
 void Control_Task_Run(void);
+
+/* 返回云台任务运行状态快照，便于调试观察电机在线与反馈。 */
+const gimbal_control_task_t *Control_Task_GetState(void);
 
 #endif
