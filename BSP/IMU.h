@@ -3,6 +3,15 @@
 
 #include "main.h"
 
+/*
+ * IMU module quick usage:
+ * - Call IMU_Init() once at startup.
+ * - Feed serial bytes using IMU_Process(data, len).
+ * - Read latest parsed HI91 state by IMU_GetState().
+ * - Use IMU_IsOnline() before trusting angle/rate feedback.
+ * - Optional: call IMU_SendRecommendedConfig() once after boot.
+ */
+
 #define IMU_FRAME_SOF_0       0x5AU
 #define IMU_FRAME_SOF_1       0xA5U
 #define IMU_HI91_TAG          0x91U
@@ -27,22 +36,22 @@ typedef struct
     uint32_t frame_count;                 /* 成功解析的 IMU 帧数量。 */
 } imu_hi91_t;
 
-/* IMU 模块状态清零。 */
+/* Reset IMU parser and clear state snapshot. */
 void IMU_Init(void);
 
-/* 向 IMU 解析器喂入一段串口原始数据。 */
+/* Feed raw UART bytes to IMU frame parser. */
 void IMU_Process(const uint8_t *data, uint16_t length);
 
-/* 获取当前 IMU 状态。 */
+/* Get pointer to latest parsed IMU state snapshot. */
 const imu_hi91_t *IMU_GetState(void);
 
-/* 查询 IMU 是否在超时窗口内。 */
+/* Return 1 when IMU data is fresh within timeout window. */
 uint8_t IMU_IsOnline(void);
 
-/* 向 IMU 发送一条 ASCII 配置命令。 */
+/* Send one ASCII command to IMU UART (CRLF auto-appended). */
 HAL_StatusTypeDef IMU_SendCommand(const char *command);
 
-/* 按当前工程假设下发推荐配置：921600 + HI91 + 1000 Hz。 */
+/* Push recommended IMU config: 921600 baud, HI91, 1000 Hz. */
 void IMU_SendRecommendedConfig(void);
 
 #endif

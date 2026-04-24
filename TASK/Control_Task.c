@@ -1,5 +1,7 @@
 #include "Control_Task.h"
 
+/* Gimbal control task: remote/keyboard mode decode + dual-loop PID for yaw/pitch. */
+
 /*
  * @file Control_Task.c
  * @brief 云台双轴控制任务。

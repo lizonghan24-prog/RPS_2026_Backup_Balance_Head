@@ -4,6 +4,8 @@
 
 #include <string.h>
 
+/* BSP glue: UART DMA -> ring buffer -> parser, CAN ISR -> motor dispatcher. */
+
 extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 extern TIM_HandleTypeDef htim6;

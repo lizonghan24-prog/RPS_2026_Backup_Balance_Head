@@ -14,6 +14,17 @@
 #include "Remote.h"
 #include "motor.h"
 
+/*
+ * Control task quick usage:
+ * - Call Control_Task_Init() once after BSP_Init().
+ * - Call Control_Task_Run() at fixed 1 kHz.
+ * - Read Control_Task_GetState() for debug.
+ *
+ * Remote mapping:
+ * - ch2 -> pitch, ch3 -> yaw
+ * - gear C -> RELAX, gear N -> REMOTE, gear S -> KEY_MOUSE
+ */
+
 extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 
@@ -24,7 +35,7 @@ extern CAN_HandleTypeDef hcan2;
 /* Pitch 轴当前使用 CAN1 上的 ID1 GM6020，按电流环方式控制。 */
 #define CONTROL_PITCH_MOTOR_CAN                     (&hcan1)
 #define CONTROL_PITCH_MOTOR_ID                      1U
-/* Yaw 轴当前使用 CAN2 上的 ID1 GM6020，按电流环方式控制。 */
+/* Yaw axis currently uses GM6020 on CAN2 motor ID5. */
 #define CONTROL_YAW_MOTOR_CAN                       (&hcan2)
 #define CONTROL_YAW_MOTOR_ID                        5U
 
@@ -156,5 +167,11 @@ void Control_Task_Run(void);
 
 /* 返回云台任务运行状态快照，便于调试观察电机在线与反馈。 */
 const gimbal_control_task_t *Control_Task_GetState(void);
+
+/* API notes:
+ * - Control_Task_Init(): initialize PIDs and motor registration.
+ * - Control_Task_Run(): execute one fixed-step control tick.
+ * - Control_Task_GetState(): inspect online flags and targets.
+ */
 
 #endif

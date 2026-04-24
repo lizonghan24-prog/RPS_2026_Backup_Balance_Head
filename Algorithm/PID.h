@@ -3,6 +3,14 @@
 
 #include "main.h"
 
+/*
+ * PID quick usage:
+ * 1) Call PID_Init() once with gains, sample time, and limits.
+ * 2) Optional: call PID_Reset() when mode changes or motor is disabled.
+ * 3) In control loop call PID_Calculate(reference, feedback) every dt.
+ * 4) If error is already computed externally, call PID_CalculateByError().
+ */
+
 /* 通用浮点 PID 控制器。 */
 typedef struct
 {
@@ -20,7 +28,7 @@ typedef struct
     float output;                        /* 当前总输出。 */
 } pid_t;
 
-/* 初始化 PID 参数和限幅。 */
+/* Initialize PID gains, dt, integral limit, and output limit. */
 void PID_Init(pid_t *pid,
               float kp,
               float ki,
@@ -29,13 +37,13 @@ void PID_Init(pid_t *pid,
               float integral_limit,
               float output_limit);
 
-/* 清空 PID 内部状态，但保留参数配置。 */
+/* Clear integrator and history while keeping gains and limits. */
 void PID_Reset(pid_t *pid);
 
-/* 按参考值和反馈值计算 PID。 */
+/* Compute PID output from reference and feedback. */
 float PID_Calculate(pid_t *pid, float reference, float feedback);
 
-/* 直接按误差计算 PID。 */
+/* Compute PID output directly from a precomputed error value. */
 float PID_CalculateByError(pid_t *pid, float error);
 
 #endif

@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+/* HI91 IMU parser: consume UART stream, decode payload, refresh online state. */
+
 extern UART_HandleTypeDef huart6;
 
 #define IMU_RX_CACHE_SIZE      256U

@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+/* VT remote parser: UART byte stream -> validated 21-byte frame -> state struct. */
+
 #define REMOTE_FRAME_HEADER_0   0xA9U
 #define REMOTE_FRAME_HEADER_1   0x53U
 #define REMOTE_CRC_OFFSET       19U

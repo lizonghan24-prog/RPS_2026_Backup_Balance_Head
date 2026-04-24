@@ -16,6 +16,13 @@ extern "C" {
 #endif
 
 /*
+ * CANBus task compatibility layer:
+ * - New motor communication is handled by BSP/motor.c.
+ * - This module keeps legacy IDs and helper APIs for compatibility.
+ * - RX path should forward to CANBus_Task_ProcessRxMessage() if used.
+ */
+
+/*
  * 
  *
  * 当前工程的 HAL 接收链路是：
@@ -55,12 +62,12 @@ extern "C" {
 #define LEFT_DOWN_FRIICTION                      0x00U
 #define RIGHT_DOWN_FRICTION                      0x00U
 
-/* 拨盘反馈 ID。 */
-#define DOWN_POKE                                0x205U
-#define UP_POKE                                  0x205U
+/* Dial feedback ID (LK on motor ID1 -> StdId 0x141). */
+#define DOWN_POKE                                0x141U
+#define UP_POKE                                  0x141U
 #define LEFT_POKE                                0x00U
 #define RIGHT_POKE                               0x00U
-#define POKE                                     0x203U
+#define POKE                                     0x141U
 
 /* 上下板通信标准帧 ID。 */
 #define UP_CAN2_TO_DOWN_CAN1_1                   0x407U
@@ -104,6 +111,8 @@ HAL_StatusTypeDef CANBus_Task_SendStdFrame(CAN_HandleTypeDef *hcan,
  * 所以这里默认不发送任何帧，只保留函数名保证旧调度代码可以链接。
  */
 void dji_can_bus_send_task(void);
+
+/* Note: in current project dial LK motor uses motor ID1 (StdId 0x141). */
 
 #ifdef __cplusplus
 }

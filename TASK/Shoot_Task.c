@@ -1,5 +1,7 @@
 #include "Shoot_Task.h"
 
+/* Shoot task: friction wheel speed loop + LK dial step control with safety interlocks. */
+
 /*
  * @file Shoot_Task.c
  * @brief 发射机构任务。
@@ -600,7 +602,7 @@ void Shoot_Task_Init(void)
         Error_Handler();
     }
 
-    /* LK 拨盘用 CAN2 上的 ID5。 */
+    /* LK dial uses CAN2 logical motor ID1 (StdId 0x141). */
     if (Motor_RegisterLk(&shoot_task_ctx.dial.motor,
                          SHOOT_DIAL_CAN,
                          SHOOT_DIAL_ID) != HAL_OK)

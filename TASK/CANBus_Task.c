@@ -1,5 +1,7 @@
 #include "CANBus_Task.h"
 
+/* Compatibility wrapper for legacy CAN task API in old project code. */
+
 /*
  * @file CANBus_Task.c
  * @brief CAN 总线任务兼容层。

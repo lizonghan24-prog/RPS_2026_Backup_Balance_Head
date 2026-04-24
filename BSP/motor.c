@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+/* Motor communication service: register, parse feedback, pack/send control frames. */
+
 /*
  * 电机服务层职责说明：
  * 1. 上层任务注册“某个电机对象在某一路 CAN、某个 ID 上”；
@@ -30,8 +32,8 @@
 #define MOTOR_DJI_GM6020_VOLTAGE_CMD_HIGH       0x2FFU
 
 /*
- * LK / RMD 常用标准帧 ID 和命令字。
- * 电机 ID5 对应 StdId 0x145，也就是 0x140 + 5。
+ * LK / RMD common standard IDs and command bytes.
+ * Motor logical ID1 maps to StdId 0x141 (0x140 + 1).
  */
 #define MOTOR_LK_STD_ID_BASE                    0x140U
 #define MOTOR_LK_CMD_STOP                       0x81U
@@ -669,8 +671,8 @@ uint8_t Motor_M3508IsOnline(const m3508_service_t *motor)
 }
 
 /*
- * 注册 LK/RMD 电机。
- * 标准帧 ID = 0x140 + motor_id，例如 ID5 对应 0x145。
+ * Register an LK/RMD motor.
+ * Standard frame ID = 0x140 + motor_id, for example ID1 -> 0x141.
  */
 HAL_StatusTypeDef Motor_RegisterLk(lk_motor_service_t *motor,
                                     CAN_HandleTypeDef *hcan,

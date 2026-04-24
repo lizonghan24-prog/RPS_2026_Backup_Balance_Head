@@ -3,6 +3,14 @@
 
 #include "main.h"
 
+/*
+ * Remote module quick usage:
+ * - Call Remote_Init() once at startup.
+ * - Feed UART bytes continuously by Remote_Process(data, len).
+ * - Read parsed state from Remote_GetState().
+ * - Use Remote_IsOnline() to gate control logic.
+ */
+
 #define REMOTE_FRAME_LEN     21U
 #define REMOTE_STICK_MIN     364U
 #define REMOTE_STICK_CENTER  1024U
@@ -60,16 +68,16 @@ typedef struct
     uint8_t last_frame[REMOTE_FRAME_LEN];         /* 最近一次收到的完整原始帧。 */
 } remote_state_t;
 
-/* 遥控模块状态清零。 */
+/* Reset remote parser state and clear the latest decoded frame. */
 void Remote_Init(void);
 
-/* 向遥控解析器喂入一段串口原始数据。 */
+/* Push a chunk of raw UART bytes into the remote frame parser. */
 void Remote_Process(const uint8_t *data, uint16_t length);
 
-/* 获取当前遥控状态。 */
+/* Get a pointer to the latest decoded remote state snapshot. */
 const remote_state_t *Remote_GetState(void);
 
-/* 查询遥控是否在超时窗口内。 */
+/* Return 1 when remote frames are still received within timeout. */
 uint8_t Remote_IsOnline(void);
 
 #endif

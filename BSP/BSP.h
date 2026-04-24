@@ -6,6 +6,13 @@
 #include "Remote.h"
 #include "motor.h"
 
+/*
+ * BSP module quick usage:
+ * - Call BSP_Init() once after HAL peripheral init in main().
+ * - Call BSP_Poll() in while(1) loop to drain UART DMA/ring buffers.
+ * - Forward UART idle IRQ to BSP_HandleUartIdle(huart).
+ */
+
 /* BSP 总初始化：启动串口 DMA 接收、CAN、1 kHz 定时器等底层资源。 */
 void BSP_Init(void);
 

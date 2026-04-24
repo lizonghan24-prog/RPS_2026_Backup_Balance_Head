@@ -18,6 +18,15 @@
 #include "Remote.h"
 #include "motor.h"
 
+/*
+ * Shoot task quick usage:
+ * - Call Shoot_Task_Init() once after BSP_Init().
+ * - Call Shoot_Task_Run() at fixed 1 kHz.
+ * - Control friction start/stop with Shoot_Task_SetFrictionEnable().
+ * - Optional: adjust wheel speed by Shoot_Task_SetFrictionTargetRpm().
+ * - Queue dial step by Shoot_Task_RequestDialStep() in closed-loop mode.
+ */
+
 extern CAN_HandleTypeDef hcan2;
 
 /* 发射任务按 1 kHz 运行，节拍由 TIM6 提供。 */
@@ -31,10 +40,10 @@ extern CAN_HandleTypeDef hcan2;
 #define SHOOT_FRICTION_RIGHT_CAN                      (&hcan2)
 #define SHOOT_FRICTION_RIGHT_ID                       2U
 
-/* ========================= LK 拨盘电机挂载配置区 ========================= */
-/* 拨盘使用 CAN2 上的 ID5 LK 电机。 */
+/* ========================= LK dial motor mapping ========================= */
+/* LK dial motor now uses CAN2 logical motor ID1 (StdId = 0x141). */
 #define SHOOT_DIAL_CAN                                (&hcan2)
-#define SHOOT_DIAL_ID                                 5U
+#define SHOOT_DIAL_ID                                 1U
 
 /* ========================= 摩擦轮目标转速配置区 ========================= */
 /* 默认左正右负；如果实物方向反了，直接改这里的符号。 */
@@ -231,5 +240,10 @@ void Shoot_Task_RequestDialStep(uint16_t step_count);
  * 返回值是内部状态快照指针，只用于读取。
  */
 const shoot_task_state_t *Shoot_Task_GetState(void);
+
+/* API notes:
+ * - SHOOT_DIAL_ID is logical LK motor ID; StdId = 0x140 + SHOOT_DIAL_ID.
+ * - Current mapping: dial ID1 -> StdId 0x141, left friction 0x201, right friction 0x202.
+ */
 
 #endif

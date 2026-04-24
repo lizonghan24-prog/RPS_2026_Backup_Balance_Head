@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+/* Simple positional PID implementation with integral and output limiting. */
+
 /* 对数值做对称限幅。 */
 static float PID_Limit(float value, float limit)
 {

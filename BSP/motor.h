@@ -8,6 +8,16 @@ extern "C" {
 #endif
 
 /*
+ * Motor service layer quick usage:
+ * 1) Call Motor_Init() once at startup.
+ * 2) Register each motor object with the correct CAN and motor ID.
+ * 3) In control task, write cached output by Motor_Set*Output().
+ * 4) Send command frames by Motor_Send*Frame() / Motor_LkSend*().
+ * 5) CAN RX callback must forward frames to Motor_ProcessCanMessage().
+ * 6) Use Motor_*IsOnline() as runtime communication health checks.
+ */
+
+/*
  * motor 层只负责三件事：
  * 1. 记录每个电机挂在哪一路 CAN、逻辑 ID 是多少；
  * 2. 把 HAL CAN 接收到的反馈帧分发到对应电机对象；
@@ -232,8 +242,8 @@ uint8_t Motor_M3508IsOnline(const m3508_service_t *motor);
 /*
  * 注册一个 LK / RMD 协议电机。
  *
- * LK 的收发标准帧 ID 通常为 0x140 + motor_id。
- * 当前工程里拨盘用 CAN2 ID5，即标准帧 ID 0x145。
+ * LK standard frame ID is usually 0x140 + motor_id.
+ * In this project the dial motor uses logical ID1, so StdId is 0x141.
  */
 HAL_StatusTypeDef Motor_RegisterLk(lk_motor_service_t *motor,
                                     CAN_HandleTypeDef *hcan,
@@ -275,6 +285,11 @@ uint8_t Motor_LkIsOnline(const lk_motor_service_t *motor);
 void Motor_ProcessCanMessage(CAN_HandleTypeDef *hcan,
                              const CAN_RxHeaderTypeDef *rx_header,
                              const uint8_t rx_data[8]);
+
+/* Mapping note:
+ * - M3508 ID1 feedback StdId = 0x201, ID2 = 0x202.
+ * - LK ID1 StdId = 0x141.
+ */
 
 #ifdef __cplusplus
 }
