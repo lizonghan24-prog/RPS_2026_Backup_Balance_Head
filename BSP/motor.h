@@ -12,7 +12,7 @@ extern "C" {
  * 1) Call Motor_Init() once at startup.
  * 2) Register each motor object with the correct CAN and motor ID.
  * 3) In control task, write cached output by Motor_Set*Output().
- * 4) Send command frames by Motor_Send*Frame() / Motor_LkSend*().
+ * 4) Send DJI command frames by Motor_Send*Frame().
  * 5) CAN RX callback must forward frames to Motor_ProcessCanMessage().
  * 6) Use Motor_*IsOnline() as runtime communication health checks.
  */
@@ -21,20 +21,20 @@ extern "C" {
  * motor 层只负责三件事：
  * 1. 记录每个电机挂在哪一路 CAN、逻辑 ID 是多少；
  * 2. 把 HAL CAN 接收到的反馈帧分发到对应电机对象；
- * 3. 按 DJI / LK 协议打包控制帧，并通过 HAL_CAN_AddTxMessage() 发出。
+ * 3. 按 DJI 协议打包控制帧，并通过 HAL_CAN_AddTxMessage() 发出。
  *
  * 上层任务不需要关心具体 StdId，也不需要在中断里手动解析 CAN 数据。
+ *
+ * 当前硬件映射补充：
+ * - Pitch：GM6020，CAN1，电机 ID5；
+ * DM4310 和 MG4310/LK 的协议细节放在 motor_dm.* / motor_lk.*，
+ * 避免把不同电机库混进这个 DJI motor 服务文件。
  */
 
 /* DJI 电机编码器一圈 8192 个计数。GM6020 / M3508 都按这个范围解析。 */
 #define MOTOR_DJI_ENCODER_RANGE                 8192U
 #define MOTOR_DJI_ENCODER_HALF_RANGE            4096
 #define MOTOR_DJI_ENCODER_DEG_PER_TICK          (360.0f / (float)MOTOR_DJI_ENCODER_RANGE)
-
-/* LK 电机状态 2 帧里的单圈编码器通常是 16 bit，按 65536 个计数解析一圈。 */
-#define MOTOR_LK_ENCODER_RANGE                  65536U
-#define MOTOR_LK_ENCODER_HALF_RANGE             32768
-#define MOTOR_LK_ENCODER_DEG_PER_TICK           (360.0f / (float)MOTOR_LK_ENCODER_RANGE)
 
 /* 超过这个时间没有收到反馈帧，就认为电机掉线。单位 ms，来源是 HAL_GetTick()。 */
 #define MOTOR_ONLINE_TIMEOUT_MS                 100U
@@ -105,35 +105,11 @@ typedef struct
     volatile float speed_dps;                    /* 便捷字段：角速度 deg/s。 */
 } m3508_service_t;
 
-/* LK 电机服务对象。当前用于拨盘，按 RMD / LK 常见 CAN 协议处理。 */
-typedef struct
-{
-    CAN_HandleTypeDef *hcan;                     /* 电机所在 CAN 句柄。 */
-    uint8_t motor_id;                            /* LK 电机 ID，StdId 通常为 0x140 + ID。 */
-    uint32_t std_id;                             /* LK 电机收发使用的标准 ID。 */
-    uint8_t initialized;                         /* 是否已经用第一帧建立单圈编码器零点。 */
-    uint16_t raw_ecd;                            /* 当前 16 bit 单圈编码器值。 */
-    uint16_t last_raw_ecd;                       /* 上一帧 16 bit 单圈编码器值。 */
-    uint16_t ecd_bias;                           /* 上电后第一帧编码器值，作为相对零点。 */
-    int16_t ecd_delta;                           /* 本帧相对上一帧的最短编码器增量。 */
-    int32_t round_count;                         /* 根据编码器跨零累计出的圈数。 */
-    int32_t total_ecd;                           /* 从上电零点开始累计的连续编码器计数。 */
-    int16_t iq_output;                           /* 上层缓存的 LK iq/力矩控制输出。 */
-    volatile uint8_t online;                     /* 最近 MOTOR_ONLINE_TIMEOUT_MS 内是否收到反馈。 */
-    volatile uint8_t output_enabled;             /* 已经发送过上电/力矩控制，且未发送 stop。 */
-    volatile uint32_t last_update_tick;          /* 最近一次收到反馈的 HAL tick。 */
-    volatile uint8_t temperature;                /* LK 状态 2 反馈温度。 */
-    volatile int16_t iq_feedback;                /* LK 状态 2 反馈 iq/力矩电流。 */
-    volatile float speed_dps;                    /* LK 状态 2 反馈速度，单位按协议记为 deg/s。 */
-    volatile float angle_deg;                    /* 以 ecd_bias 为零点的相对角度，单位 deg。 */
-    volatile float total_angle_deg;              /* 从上电开始累计的连续角度，单位 deg。 */
-} lk_motor_service_t;
-
 /*
  * 初始化 motor 服务层。
  *
  * 作用：
- * - 清空 GM6020 / M3508 / LK 三类电机的注册表；
+ * - 清空 GM6020 / M3508 两类 DJI 电机的注册表；
  * - 不直接启动 CAN，CAN 的过滤器、启动和中断由 BSP_Init() 负责；
  * - 通常在 BSP_Init() 中、上层任务注册电机之前调用一次。
  */
@@ -240,43 +216,6 @@ HAL_StatusTypeDef Motor_SendM3508CurrentLoopFrame(const m3508_service_t *motor1,
 uint8_t Motor_M3508IsOnline(const m3508_service_t *motor);
 
 /*
- * 注册一个 LK / RMD 协议电机。
- *
- * LK standard frame ID is usually 0x140 + motor_id.
- * In this project the dial motor uses logical ID1, so StdId is 0x141.
- */
-HAL_StatusTypeDef Motor_RegisterLk(lk_motor_service_t *motor,
-                                    CAN_HandleTypeDef *hcan,
-                                    uint8_t motor_id);
-
-/*
- * 缓存 LK 电机 iq/力矩输出。
- *
- * 这个函数只写 iq_output，不发 CAN；发帧使用 Motor_LkSendIqControl()。
- */
-void Motor_SetLkIqOutput(lk_motor_service_t *motor, int16_t output);
-
-/* 发送 LK 上电 / 输出使能命令 0x88。 */
-HAL_StatusTypeDef Motor_LkSendPowerOn(lk_motor_service_t *motor);
-
-/* 发送 LK 停止命令 0x81，并在发送成功后清 output_enabled 标志。 */
-HAL_StatusTypeDef Motor_LkSendStop(lk_motor_service_t *motor);
-
-/*
- * 发送 LK 状态 2 查询命令 0x9C。
- *
- * 状态 2 回包里包含温度、iq 反馈、速度和编码器值，
- * 当前拨盘在线检测和反馈刷新主要依赖这条命令。
- */
-HAL_StatusTypeDef Motor_LkSendReadState2Request(lk_motor_service_t *motor);
-
-/* 发送 LK iq/力矩控制命令 0xA1，命令值来自 motor->iq_output。 */
-HAL_StatusTypeDef Motor_LkSendIqControl(lk_motor_service_t *motor);
-
-/* 刷新并返回 LK 电机在线状态。 */
-uint8_t Motor_LkIsOnline(const lk_motor_service_t *motor);
-
-/*
  * CAN 接收帧统一分发入口。
  *
  * BSP 在 HAL_CAN_RxFifo0MsgPendingCallback() 中取出 CAN 帧后调用此函数。
@@ -287,8 +226,7 @@ void Motor_ProcessCanMessage(CAN_HandleTypeDef *hcan,
                              const uint8_t rx_data[8]);
 
 /* Mapping note:
- * - M3508 ID1 feedback StdId = 0x201, ID2 = 0x202.
- * - LK ID1 StdId = 0x141.
+ * - GM6020 pitch ID5 feedback StdId = 0x209.
  */
 
 #ifdef __cplusplus

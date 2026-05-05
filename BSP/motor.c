@@ -11,6 +11,8 @@
  * 3. 本文件按 hcan + StdId 找到对象，刷新反馈、在线标志和时间戳；
  * 4. 上层任务写 output 后，调用发送函数把同组电机一次性打包发出。
  *
+ * DM4310 和 MG4310/LK 的协议细节分别在 motor_dm.c 和 motor_lk.c 中维护。
+ *
  * 注意：本文件不负责 CAN 外设初始化，也不负责闭环 PID 计算。
  */
 
@@ -31,23 +33,11 @@
 #define MOTOR_DJI_GM6020_VOLTAGE_CMD_LOW        0x1FFU
 #define MOTOR_DJI_GM6020_VOLTAGE_CMD_HIGH       0x2FFU
 
-/*
- * LK / RMD common standard IDs and command bytes.
- * Motor logical ID1 maps to StdId 0x141 (0x140 + 1).
- */
-#define MOTOR_LK_STD_ID_BASE                    0x140U
-#define MOTOR_LK_CMD_STOP                       0x81U
-#define MOTOR_LK_CMD_POWER_ON                   0x88U
-#define MOTOR_LK_CMD_READ_STATE_2               0x9CU
-#define MOTOR_LK_CMD_IQ_CONTROL                 0xA1U
-
 #define MOTOR_MAX_GM6020_COUNT                  8U      /* GM6020 注册表容量，足够覆盖一条 CAN 上的常用 ID。 */
 #define MOTOR_MAX_M3508_COUNT                   8U      /* M3508/M2006 注册表容量，对应 DJI ID1~ID8。 */
-#define MOTOR_MAX_LK_COUNT                      8U      /* LK 注册表容量，当前拨盘只用 1 个，预留扩展。 */
 
 static gm6020_service_t *gm6020_registry[MOTOR_MAX_GM6020_COUNT];
 static m3508_service_t *m3508_registry[MOTOR_MAX_M3508_COUNT];
-static lk_motor_service_t *lk_registry[MOTOR_MAX_LK_COUNT];
 
 /*
  * 注册表只保存对象指针，不申请也不释放内存。
@@ -60,18 +50,6 @@ static int16_t Motor_ReadInt16BE(const uint8_t *data)
     return (int16_t)((uint16_t)((uint16_t)data[0] << 8) | (uint16_t)data[1]);
 }
 
-/* 把小端格式的两个字节还原成 int16_t，LK 状态帧使用这种顺序。 */
-static int16_t Motor_ReadInt16LE(const uint8_t *data)
-{
-    return (int16_t)((uint16_t)((uint16_t)data[1] << 8) | (uint16_t)data[0]);
-}
-
-/* 把小端格式的两个字节还原成 uint16_t，用来解析 LK 单圈编码器值。 */
-static uint16_t Motor_ReadUint16LE(const uint8_t *data)
-{
-    return (uint16_t)((uint16_t)((uint16_t)data[1] << 8) | (uint16_t)data[0]);
-}
-
 /* 把 int16_t 拆成高字节在前、低字节在后的格式。 */
 static void Motor_WriteInt16BE(uint8_t *data, uint8_t slot, int16_t value)
 {
@@ -80,13 +58,6 @@ static void Motor_WriteInt16BE(uint8_t *data, uint8_t slot, int16_t value)
     index = (uint8_t)(slot * 2U);
     data[index] = (uint8_t)((uint16_t)value >> 8);
     data[index + 1U] = (uint8_t)((uint16_t)value & 0xFFU);
-}
-
-/* LK 控制命令里 iq 给定值放在 data[4]/data[5]，采用小端格式。 */
-static void Motor_WriteInt16LE(uint8_t *data, uint8_t index, int16_t value)
-{
-    data[index] = (uint8_t)((uint16_t)value & 0xFFU);
-    data[index + 1U] = (uint8_t)((uint16_t)value >> 8);
 }
 
 /* HAL CAN 的标准数据帧发送封装，所有 motor 层发送最终都走这里。 */
@@ -170,38 +141,6 @@ static HAL_StatusTypeDef Motor_RegisterM3508Object(m3508_service_t *motor)
         if (m3508_registry[i] == NULL)
         {
             m3508_registry[i] = motor;
-            return HAL_OK;
-        }
-    }
-
-    return HAL_ERROR;
-}
-
-/*
- * 把 LK 对象挂入注册表。
- * LK 协议收发共用 0x140 + ID，所以匹配键使用 hcan + std_id。
- */
-static HAL_StatusTypeDef Motor_RegisterLkObject(lk_motor_service_t *motor)
-{
-    uint8_t i;
-
-    for (i = 0U; i < MOTOR_MAX_LK_COUNT; ++i)
-    {
-        if ((lk_registry[i] == motor)
-         || ((lk_registry[i] != NULL)
-          && (lk_registry[i]->hcan == motor->hcan)
-          && (lk_registry[i]->std_id == motor->std_id)))
-        {
-            lk_registry[i] = motor;
-            return HAL_OK;
-        }
-    }
-
-    for (i = 0U; i < MOTOR_MAX_LK_COUNT; ++i)
-    {
-        if (lk_registry[i] == NULL)
-        {
-            lk_registry[i] = motor;
             return HAL_OK;
         }
     }
@@ -300,61 +239,6 @@ static void Motor_CopyDjiFeedbackToM3508(m3508_service_t *motor)
     motor->angle_deg = motor->feedback.angle_deg;
     motor->total_angle_deg = motor->feedback.total_angle_deg;
     motor->speed_dps = motor->feedback.speed_dps;
-}
-
-/*
- * LK 状态 2 反馈解析：
- * data[0] = 0x9C 或力矩控制返回的 0xA1；
- * data[1] = 温度；
- * data[2..3] = iq/力矩电流，小端；
- * data[4..5] = 速度，小端；
- * data[6..7] = 单圈编码器，小端。
- */
-static void Motor_UpdateLkState2(lk_motor_service_t *motor, const uint8_t data[8])
-{
-    uint16_t raw_ecd;
-    int32_t delta;
-
-    raw_ecd = Motor_ReadUint16LE(&data[6]);
-
-    if (motor->initialized == 0U)
-    {
-        motor->initialized = 1U;
-        motor->raw_ecd = raw_ecd;
-        motor->last_raw_ecd = raw_ecd;
-        motor->ecd_bias = raw_ecd;
-        motor->ecd_delta = 0;
-        motor->round_count = 0;
-        motor->total_ecd = 0;
-    }
-    else
-    {
-        motor->last_raw_ecd = motor->raw_ecd;
-        motor->raw_ecd = raw_ecd;
-
-        delta = (int32_t)motor->raw_ecd - (int32_t)motor->last_raw_ecd;
-        if (delta < -MOTOR_LK_ENCODER_HALF_RANGE)
-        {
-            delta += (int32_t)MOTOR_LK_ENCODER_RANGE;
-            motor->round_count++;
-        }
-        else if (delta > MOTOR_LK_ENCODER_HALF_RANGE)
-        {
-            delta -= (int32_t)MOTOR_LK_ENCODER_RANGE;
-            motor->round_count--;
-        }
-
-        motor->ecd_delta = (int16_t)delta;
-        motor->total_ecd += delta;
-    }
-
-    motor->temperature = data[1];
-    motor->iq_feedback = Motor_ReadInt16LE(&data[2]);
-    motor->speed_dps = (float)Motor_ReadInt16LE(&data[4]);
-    motor->angle_deg = ((float)((int32_t)motor->raw_ecd - (int32_t)motor->ecd_bias)
-                      * MOTOR_LK_ENCODER_DEG_PER_TICK)
-                     + ((float)motor->round_count * 360.0f);
-    motor->total_angle_deg = (float)motor->total_ecd * MOTOR_LK_ENCODER_DEG_PER_TICK;
 }
 
 /*
@@ -501,14 +385,13 @@ static HAL_StatusTypeDef Motor_SendM3508FrameById(const m3508_service_t *motor1,
 }
 
 /*
- * 清空三类电机注册表。
+ * 清空 DJI 电机注册表。
  * 该函数通常在 BSP 初始化阶段调用一次，之后由控制任务/发射任务重新注册电机。
  */
 void Motor_Init(void)
 {
     memset(gm6020_registry, 0, sizeof(gm6020_registry));
     memset(m3508_registry, 0, sizeof(m3508_registry));
-    memset(lk_registry, 0, sizeof(lk_registry));
 }
 
 /*
@@ -671,131 +554,6 @@ uint8_t Motor_M3508IsOnline(const m3508_service_t *motor)
 }
 
 /*
- * Register an LK/RMD motor.
- * Standard frame ID = 0x140 + motor_id, for example ID1 -> 0x141.
- */
-HAL_StatusTypeDef Motor_RegisterLk(lk_motor_service_t *motor,
-                                    CAN_HandleTypeDef *hcan,
-                                    uint8_t motor_id)
-{
-    if ((motor == NULL) || (hcan == NULL) || (motor_id == 0U) || (motor_id > 0x7FU))
-    {
-        return HAL_ERROR;
-    }
-
-    memset(motor, 0, sizeof(*motor));
-    motor->hcan = hcan;
-    motor->motor_id = motor_id;
-    motor->std_id = MOTOR_LK_STD_ID_BASE + (uint32_t)motor_id;
-
-    return Motor_RegisterLkObject(motor);
-}
-
-/* 缓存 LK iq/力矩输出，不立即发送 CAN。 */
-void Motor_SetLkIqOutput(lk_motor_service_t *motor, int16_t output)
-{
-    if (motor != NULL)
-    {
-        motor->iq_output = output;
-    }
-}
-
-/* 发送 LK 上电/使能命令 0x88。 */
-HAL_StatusTypeDef Motor_LkSendPowerOn(lk_motor_service_t *motor)
-{
-    HAL_StatusTypeDef status;
-    uint8_t tx_data[8];
-
-    if ((motor == NULL) || (motor->hcan == NULL))
-    {
-        return HAL_ERROR;
-    }
-
-    memset(tx_data, 0, sizeof(tx_data));
-    tx_data[0] = MOTOR_LK_CMD_POWER_ON;
-    status = Motor_SendStdFrame(motor->hcan, motor->std_id, tx_data);
-    if (status == HAL_OK)
-    {
-        motor->output_enabled = 1U;
-    }
-
-    return status;
-}
-
-/* 发送 LK 停止命令 0x81。 */
-HAL_StatusTypeDef Motor_LkSendStop(lk_motor_service_t *motor)
-{
-    HAL_StatusTypeDef status;
-    uint8_t tx_data[8];
-
-    if ((motor == NULL) || (motor->hcan == NULL))
-    {
-        return HAL_ERROR;
-    }
-
-    memset(tx_data, 0, sizeof(tx_data));
-    tx_data[0] = MOTOR_LK_CMD_STOP;
-    status = Motor_SendStdFrame(motor->hcan, motor->std_id, tx_data);
-    if (status == HAL_OK)
-    {
-        motor->output_enabled = 0U;
-    }
-
-    return status;
-}
-
-/* 发送 LK 状态 2 查询命令 0x9C，用于刷新温度、速度、电流和编码器。 */
-HAL_StatusTypeDef Motor_LkSendReadState2Request(lk_motor_service_t *motor)
-{
-    uint8_t tx_data[8];
-
-    if ((motor == NULL) || (motor->hcan == NULL))
-    {
-        return HAL_ERROR;
-    }
-
-    memset(tx_data, 0, sizeof(tx_data));
-    tx_data[0] = MOTOR_LK_CMD_READ_STATE_2;
-
-    return Motor_SendStdFrame(motor->hcan, motor->std_id, tx_data);
-}
-
-/* 发送 LK iq/力矩控制命令 0xA1。 */
-HAL_StatusTypeDef Motor_LkSendIqControl(lk_motor_service_t *motor)
-{
-    HAL_StatusTypeDef status;
-    uint8_t tx_data[8];
-
-    if ((motor == NULL) || (motor->hcan == NULL))
-    {
-        return HAL_ERROR;
-    }
-
-    memset(tx_data, 0, sizeof(tx_data));
-    tx_data[0] = MOTOR_LK_CMD_IQ_CONTROL;
-    Motor_WriteInt16LE(tx_data, 4U, motor->iq_output);
-
-    status = Motor_SendStdFrame(motor->hcan, motor->std_id, tx_data);
-    if (status == HAL_OK)
-    {
-        motor->output_enabled = 1U;
-    }
-
-    return status;
-}
-
-/* 返回 LK 在线状态。 */
-uint8_t Motor_LkIsOnline(const lk_motor_service_t *motor)
-{
-    if ((motor == NULL) || (motor->online == 0U))
-    {
-        return 0U;
-    }
-
-    return Motor_IsRecent(motor->last_update_tick);
-}
-
-/*
  * 处理并分发一帧 CAN 接收数据。
  * BSP 的 CAN FIFO 回调会把 HAL 读出的 rx_header/rx_data 传进来。
  */
@@ -841,34 +599,5 @@ void Motor_ProcessCanMessage(CAN_HandleTypeDef *hcan,
         }
     }
 
-    if (rx_header->DLC < 8U)
-    {
-        return;
-    }
-
-    for (i = 0U; i < MOTOR_MAX_LK_COUNT; ++i)
-    {
-        if ((lk_registry[i] != NULL)
-         && (lk_registry[i]->hcan == hcan)
-         && (lk_registry[i]->std_id == rx_header->StdId))
-        {
-            if ((rx_data[0] == MOTOR_LK_CMD_READ_STATE_2)
-             || (rx_data[0] == MOTOR_LK_CMD_IQ_CONTROL))
-            {
-                Motor_UpdateLkState2(lk_registry[i], rx_data);
-            }
-            else if (rx_data[0] == MOTOR_LK_CMD_POWER_ON)
-            {
-                lk_registry[i]->output_enabled = 1U;
-            }
-            else if (rx_data[0] == MOTOR_LK_CMD_STOP)
-            {
-                lk_registry[i]->output_enabled = 0U;
-            }
-
-            Motor_TouchOnline(&lk_registry[i]->online, &lk_registry[i]->last_update_tick);
-            return;
-        }
-    }
 }
 

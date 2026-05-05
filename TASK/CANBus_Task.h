@@ -46,9 +46,9 @@ extern "C" {
 #define CM3Encoder_MOTOR                         0x00U
 #define CM4Encoder_MOTOR                         0x00U
 
-/* 云台 GM6020 反馈 ID。 */
-#define GIMBAL_YAW_MOTOR                         0x209U
-#define GIMBAL_PITCH_MOTOR                       0x205U
+/* 云台电机反馈/控制相关 ID：Pitch 是 CAN1 ID5 GM6020，Yaw 是 CAN2 ID1 DM4310。 */
+#define GIMBAL_YAW_MOTOR                         0x001U
+#define GIMBAL_PITCH_MOTOR                       0x209U
 
 /* 英雄小云台相关电机反馈 ID。 */
 #define SMALL_GIMBAL_MOTOR                       0x00U
@@ -62,7 +62,7 @@ extern "C" {
 #define LEFT_DOWN_FRIICTION                      0x00U
 #define RIGHT_DOWN_FRICTION                      0x00U
 
-/* Dial feedback ID (LK on motor ID1 -> StdId 0x141). */
+/* 拨盘 MG4310/LK 协议反馈 ID：逻辑 ID1 -> StdId 0x141。 */
 #define DOWN_POKE                                0x141U
 #define UP_POKE                                  0x141U
 #define LEFT_POKE                                0x00U

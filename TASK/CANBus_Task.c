@@ -9,6 +9,8 @@
  */
 
 #include "motor.h"
+#include "motor_dm.h"
+#include "motor_lk.h"
 
 #include <string.h>
 
@@ -48,7 +50,7 @@ HAL_StatusTypeDef CANBus_Task_SendStdFrame(CAN_HandleTypeDef *hcan,
 /*
  * HAL CAN 接收帧统一处理。
  *
- * 目前 CANBus_Task 不重复解析电机反馈，而是直接转交给 motor 层。
+ * 目前 CANBus_Task 不重复解析电机反馈，而是直接转交给各自的电机协议层。
 
  */
 void CANBus_Task_ProcessRxMessage(CAN_HandleTypeDef *hcan,
@@ -66,8 +68,10 @@ void CANBus_Task_ProcessRxMessage(CAN_HandleTypeDef *hcan,
         return;
     }
 
-    /* 电机反馈的具体协议解析统一交给 motor 层。 */
+    /* DJI、DM4310、LK/MG4310 分别交给原有分类文件处理。 */
     Motor_ProcessCanMessage(hcan, rx_header, rx_data);
+    Motor_Dm4310ProcessCanMessage(hcan, rx_header, rx_data);
+    Motor_LkProcessCanMessage(hcan, rx_header, rx_data);
 }
 
 /*

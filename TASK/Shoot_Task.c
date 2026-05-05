@@ -8,19 +8,24 @@
  *
  * 本文件负责两部分：
  * 1. 摩擦轮：两路 M3508 速度闭环，负责起转、停转、速度斜坡和 ready 判定；
- * 2. 拨盘：LK 电机角度步进闭环，只有摩擦轮转稳后才允许进入闭环。
+ * 2. 拨盘：MG4310/LK 电机角度步进闭环，只有摩擦轮转稳后才允许进入闭环。
  *
  * 任务安全策略：
  * - 遥控 pause 或关键电机掉线时，摩擦轮和拨盘都回到停止状态；
  * - 摩擦轮未达到稳定状态时，拨盘不会执行推弹；
  * - 模式切换时清 PID 和历史步进请求，避免旧积分或旧目标造成突然动作。
  *
- * 电机反馈解析、在线检测和 CAN 协议打包由 BSP/motor.c 完成。
+ * DJI 摩擦轮反馈解析和发送打包由 BSP/motor.c 完成。
+ * LK/MG4310 拨盘反馈解析和发送打包由 BSP/motor_lk.c 完成。
+ *
+ * 当前拨盘硬件是 CAN2 ID1 的 MG4310，使用 LK/RMD 协议，StdId = 0x141。
+ * 它和 yaw 的 DM4310 都是逻辑 ID1，但 CAN 标准帧 ID 不同，motor 层会分开匹配。
  */
 
 #include "PID.h"
 #include "Remote.h"
 #include "motor.h"
+#include "motor_lk.h"
 
 #include <string.h>
 
@@ -229,7 +234,7 @@ static void Shoot_ClearDialPendingStep(void)
     shoot_task_ctx.dial.pending_step_count = 0U;
 }
 
-/* 停机状态下按固定节拍查询一次 LK 状态，维持在线监测。 */
+/* 停机状态下按固定节拍查询一次 MG4310/LK 状态，维持在线监测。 */
 static void Shoot_PollDialState(void)
 {
     shoot_task_ctx.dial.state_poll_tick++;
@@ -363,7 +368,7 @@ static void Shoot_HandleFrictionModeTransition(void)
  * 当前三条缺一不可：
  * 1. 摩擦轮模式必须已经在 RUN
  * 2. friction_ready 必须已经成立
- * 3. LK 拨盘电机必须在线
+ * 3. MG4310/LK 拨盘电机必须在线
  *
  * 这就是拨盘的总联锁。
  * 只有摩擦轮真正转稳以后，拨盘才允许开始闭环推弹。
@@ -571,7 +576,7 @@ static void Shoot_UpdatePublicState(void)
  * - main() 完成 BSP_Init() 和 motor 层初始化后调用一次。
  *
  * 初始化内容：
- * - 注册左右摩擦轮 M3508 和 LK 拨盘电机；
+ * - 注册左右摩擦轮 M3508 和 MG4310/LK 拨盘电机；
  * - 初始化摩擦轮速度 PID、拨盘角度 PID、拨盘速度 PID；
  * - 设置默认摩擦轮目标转速和拨盘单步角度；
  * - 主动查询一次 LK 状态，让在线检测更快建立。
@@ -602,7 +607,7 @@ void Shoot_Task_Init(void)
         Error_Handler();
     }
 
-    /* LK dial uses CAN2 logical motor ID1 (StdId 0x141). */
+    /* 拨盘：MG4310/LK 协议，CAN2 逻辑 ID1，StdId 0x141。 */
     if (Motor_RegisterLk(&shoot_task_ctx.dial.motor,
                          SHOOT_DIAL_CAN,
                          SHOOT_DIAL_ID) != HAL_OK)

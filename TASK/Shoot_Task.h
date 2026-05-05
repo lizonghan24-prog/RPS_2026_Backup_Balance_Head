@@ -17,6 +17,7 @@
 #include "PID.h"
 #include "Remote.h"
 #include "motor.h"
+#include "motor_lk.h"
 
 /*
  * Shoot task quick usage:
@@ -25,6 +26,10 @@
  * - Control friction start/stop with Shoot_Task_SetFrictionEnable().
  * - Optional: adjust wheel speed by Shoot_Task_SetFrictionTargetRpm().
  * - Queue dial step by Shoot_Task_RequestDialStep() in closed-loop mode.
+ *
+ * Dial hardware:
+ * - MG4310 using LK/RMD protocol, CAN2, logical ID1.
+ * - StdId = 0x140 + 1 = 0x141, so it does not conflict with yaw DM4310 ID1.
  */
 
 extern CAN_HandleTypeDef hcan2;
@@ -40,8 +45,8 @@ extern CAN_HandleTypeDef hcan2;
 #define SHOOT_FRICTION_RIGHT_CAN                      (&hcan2)
 #define SHOOT_FRICTION_RIGHT_ID                       2U
 
-/* ========================= LK dial motor mapping ========================= */
-/* LK dial motor now uses CAN2 logical motor ID1 (StdId = 0x141). */
+/* ========================= MG4310 / LK 拨盘电机挂载配置区 ========================= */
+/* 拨盘使用 MG4310 的 LK/RMD 协议：CAN2 逻辑 ID1，标准帧 ID = 0x141。 */
 #define SHOOT_DIAL_CAN                                (&hcan2)
 #define SHOOT_DIAL_ID                                 1U
 
@@ -122,7 +127,7 @@ typedef struct
     uint8_t remote_online;                      /* 当前图传遥控是否在线。 */
     uint8_t left_motor_online;                  /* 左摩擦轮电机是否在线。 */
     uint8_t right_motor_online;                 /* 右摩擦轮电机是否在线。 */
-    uint8_t dial_motor_online;                  /* LK 拨盘电机是否在线。 */
+    uint8_t dial_motor_online;                  /* MG4310/LK 拨盘电机是否在线。 */
     uint8_t software_enable_request;            /* 软件侧是否请求开启摩擦轮。 */
     uint8_t remote_enable_request;              /* 遥控侧是否请求开启摩擦轮。 */
     uint8_t friction_ready;                     /* 摩擦轮是否已经达到允许拨盘闭环的稳定状态。 */
@@ -158,10 +163,10 @@ typedef struct
     float target_current;                            /* 速度环输出的目标电流。 */
 } shoot_friction_wheel_t;
 
-/* LK 拨盘控制对象。 */
+/* MG4310/LK 拨盘控制对象。 */
 typedef struct
 {
-    lk_motor_service_t motor;                        /* 当前拨盘绑定的 LK 电机服务对象。 */
+    lk_motor_service_t motor;                        /* 当前拨盘绑定的 MG4310/LK 电机服务对象。 */
     pid_t angle_pid;                                 /* 拨盘外环角度 PID。 */
     pid_t speed_pid;                                 /* 拨盘内环速度 PID。 */
     float step_angle_deg;                            /* 单次步进角度，单位 deg。 */
@@ -184,7 +189,7 @@ typedef struct
     uint8_t remote_online;                           /* 图传遥控在线标志。 */
     uint8_t left_motor_online;                       /* 左摩擦轮在线标志。 */
     uint8_t right_motor_online;                      /* 右摩擦轮在线标志。 */
-    uint8_t dial_motor_online;                       /* LK 拨盘在线标志。 */
+    uint8_t dial_motor_online;                       /* MG4310/LK 拨盘在线标志。 */
     uint8_t software_enable_request;                 /* 软件侧是否请求开启摩擦轮。 */
     uint8_t remote_enable_request;                   /* 遥控侧是否请求开启摩擦轮。 */
     uint8_t friction_ready;                          /* 两路摩擦轮是否已经转稳。 */

@@ -1,35 +1,30 @@
-#include "Control_Task.h"
-
-/* Gimbal control task: remote/keyboard mode decode + dual-loop PID for yaw/pitch. */
+﻿#include "Control_Task.h"
+#include "Up_Task.h"
 
 /*
- * @file Control_Task.c
- * @brief 云台双轴控制任务。
+ * 云台控制函数库。
  *
- * 本文件负责 Pitch / Yaw 两个 GM6020 云台电机的上层闭环：
- * 1. 从 IMU 读取姿态角和角速度反馈；
- * 2. 从图传遥控读取挡位、摇杆和鼠标输入；
- * 3. 根据在线状态和遥控输入决定无力、遥控器、键鼠模式；
- * 4. 执行“角度外环 + 角速度内环”的双环 PID；
- * 5. 把计算出的电流给定缓存到 motor 层，再由 motor 层按 DJI 协议发 CAN。
- *
- * 注意：
- * - CAN 外设初始化、滤波器和中断接收不在本文件处理；
- * - GM6020 反馈解析和发送打包由 BSP/motor.c 负责；
- * - 本文件只关心任务逻辑和控制量计算。
+ * 的控制基础能力：目标限幅、反馈更新、PID 双环、
+ * 电机注册和 CAN 输出辅助函数。真正的每拍控制顺序由 Up_Task.c 负责；
+ * 如果逻辑有冲突，以 Mode_Switch_Task.c 和 Up_Task.c 为准。
  */
 
 #include "PID.h"
 #include "IMU.h"
 #include "Remote.h"
 #include "motor.h"
+#include "motor_dm.h"
 
+#include <math.h>
 #include <string.h>
 
-/* 云台任务的唯一全局上下文，所有运行时状态都集中放在这里。 */
+/* 云台控制共享状态，由 Up_Task 通过公开辅助函数驱动。 */
 gimbal_control_task_t gimbal_control;
 
-/* 把数值限制在给定区间内。 */
+static void Control_StopGimbalOutput(void);
+static void Control_SendGimbalOutput(void);
+
+/* 将数值限制在给定范围内。 */
 static float Control_Limit(float value, float min_value, float max_value)
 {
     if (value > max_value)
@@ -45,7 +40,7 @@ static float Control_Limit(float value, float min_value, float max_value)
     return value;
 }
 
-/* 把角度规范到 [-180, 180]。 */
+/* 将角度归一化到 [-180, 180]。 */
 static float Control_NormalizeAngle180(float angle_deg)
 {
     while (angle_deg > 180.0f)
@@ -61,7 +56,7 @@ static float Control_NormalizeAngle180(float angle_deg)
     return angle_deg;
 }
 
-/* 计算角度误差。回环轴按最短路径取误差。 */
+/* 计算角度误差；回环轴使用最短角度路径。 */
 static float Control_CalcAngleError(float target_angle_deg, float feedback_angle_deg, uint8_t wrap_enable)
 {
     float error;
@@ -75,7 +70,34 @@ static float Control_CalcAngleError(float target_angle_deg, float feedback_angle
     return error;
 }
 
-/* 统一约束目标角，避免目标值越界。 */
+/* 根据当前反馈，计算离反馈最近的 360 度等效目标。 */
+static float Control_CalcNearestWrappedReference(float target_angle_deg, float feedback_angle_deg)
+{
+    int32_t rotate_num;
+    float reference;
+    float error;
+
+    /*
+     * 对齐原 gimbal_init_handle() 的思路：
+     * yaw 初始化时选择最近的等效目标，让电机走劣弧，而不是多转一整圈。
+     */
+    rotate_num = (int32_t)(feedback_angle_deg / 360.0f);
+    reference = ((float)rotate_num * 360.0f) + target_angle_deg;
+    error = reference - feedback_angle_deg;
+
+    if (error >= 181.0f)
+    {
+        reference -= 360.0f;
+    }
+    else if (error < -179.0f)
+    {
+        reference += 360.0f;
+    }
+
+    return reference;
+}
+
+/* 将目标限制在机械范围内，或对回环轴做角度归一化。 */
 static void Control_ClampAxisTarget(gimbal_axis_control_t *axis)
 {
     if (axis->wrap_enable != 0U)
@@ -90,14 +112,14 @@ static void Control_ClampAxisTarget(gimbal_axis_control_t *axis)
     }
 }
 
-/* 把目标角对齐到当前反馈角，切模式时可以避免跳变。 */
+/* 将目标角对齐到最新反馈角。 */
 static void Control_AlignAxisTargetToFeedback(gimbal_axis_control_t *axis)
 {
     axis->target_angle_deg = axis->angle_feedback_deg;
     Control_ClampAxisTarget(axis);
 }
 
-/* 给单路遥控输入做死区处理。 */
+/* 遥控通道输入死区处理。 */
 static int16_t Control_ApplyRemoteDeadband(int16_t input)
 {
     if ((input < CONTROL_REMOTE_DEADBAND) && (input > -CONTROL_REMOTE_DEADBAND))
@@ -108,7 +130,7 @@ static int16_t Control_ApplyRemoteDeadband(int16_t input)
     return input;
 }
 
-/* 给鼠标输入做死区处理，滤掉静止附近的小抖动。 */
+/* 鼠标输入死区处理，用来抑制微小抖动。 */
 static int16_t Control_ApplyMouseDeadband(int16_t input)
 {
     if ((input < CONTROL_MOUSE_DEADBAND) && (input > -CONTROL_MOUSE_DEADBAND))
@@ -119,14 +141,14 @@ static int16_t Control_ApplyMouseDeadband(int16_t input)
     return input;
 }
 
-/* 刷新单个轴的 IMU 反馈。 */
+/* 把选定的 IMU 反馈通道写入单轴控制状态。 */
 static void Control_UpdateAxisFeedback(gimbal_axis_control_t *axis, const imu_hi91_t *imu)
 {
     axis->angle_feedback_deg = imu->euler_deg[axis->imu_angle_index];
     axis->speed_feedback_dps = imu->gyr_dps[axis->imu_rate_index];
 }
 
-/* 根据遥控输入更新单个轴的目标角。 */
+/* 将遥控摇杆输入积分到单轴目标角。 */
 static void Control_UpdateAxisTargetByRemote(gimbal_axis_control_t *axis,
                                              const remote_state_t *remote,
                                              float scale_ratio)
@@ -148,7 +170,7 @@ static void Control_UpdateAxisTargetByRemote(gimbal_axis_control_t *axis,
     Control_ClampAxisTarget(axis);
 }
 
-/* 键鼠模式下根据鼠标输入更新单个轴的目标角。 */
+/* 将鼠标输入积分到单轴目标角。 */
 static void Control_UpdateAxisTargetByMouse(gimbal_axis_control_t *axis, int16_t mouse_input)
 {
     float delta_angle_deg;
@@ -163,19 +185,10 @@ static void Control_UpdateAxisTargetByMouse(gimbal_axis_control_t *axis, int16_t
 }
 
 /*
- * 根据当前反馈角检查机械限位保护。
- * 这里只对非回环轴生效，也就是当前的 pitch 轴。
+ * 对非回环轴做机械限位保护。
  *
- * 触发条件：
- * 1. 当前反馈角已经超过配置的最大角度 + 保护裕量
- * 2. 当前反馈角已经低于配置的最小角度 - 保护裕量
- *
- * 触发动作：
- * 1. 立刻把目标角钳回到允许范围边界
- * 2. 拉起 limit_active 标志，方便上层调试时观察
- *
- * 这样做的目的不是“撞到限位后继续顶住”，而是发现越界趋势后，
- * 直接把目标值拉回安全区，避免控制器继续往错误方向积分。
+ * pitch 作为有机械限位的轴处理。当反馈超出配置范围和保护裕量后，
+ * 目标会被拉回到最近的合法限位，同时置位 limit_active 便于调试观察。
  */
 static void Control_ApplyAxisLimitProtection(gimbal_axis_control_t *axis)
 {
@@ -200,7 +213,71 @@ static void Control_ApplyAxisLimitProtection(gimbal_axis_control_t *axis)
     Control_ClampAxisTarget(axis);
 }
 
-/* 执行单个轴的双环 PID。 */
+/*
+ * 按当前轴绑定的电机协议查询在线状态。
+ * 当前 pitch 使用 GM6020，yaw 使用 DM4310。
+ */
+static uint8_t Control_IsAxisMotorOnline(const gimbal_axis_control_t *axis)
+{
+    if (axis == NULL)
+    {
+        return 0U;
+    }
+
+    if (axis->motor_type == CONTROL_AXIS_MOTOR_DM4310)
+    {
+        return Motor_Dm4310IsOnline(&axis->dm4310_motor);
+    }
+
+    return Motor_Gm6020IsOnline(&axis->gm6020_motor);
+}
+
+/*
+ * 将控制器输出写入对应轴的电机服务对象。
+ * output_sign 用于在底层发送前补偿电机安装方向。
+ */
+static void Control_SetAxisMotorOutput(gimbal_axis_control_t *axis, float output)
+{
+    float signed_output;
+
+    if (axis == NULL)
+    {
+        return;
+    }
+
+    signed_output = output * axis->output_sign;
+    if (axis->motor_type == CONTROL_AXIS_MOTOR_DM4310)
+    {
+        Motor_SetDm4310MitTorque(&axis->dm4310_motor, signed_output);
+    }
+    else
+    {
+        Motor_SetGm6020CurrentLoopOutput(&axis->gm6020_motor, (int16_t)signed_output);
+    }
+}
+
+/*
+ * 发送已经准备好的电机控制帧。
+ * GM6020 使用 DJI 电流环帧，DM4310 使用 MIT 控制帧。
+ */
+static void Control_SendAxisMotorOutput(gimbal_axis_control_t *axis)
+{
+    if (axis == NULL)
+    {
+        return;
+    }
+
+    if (axis->motor_type == CONTROL_AXIS_MOTOR_DM4310)
+    {
+        (void)Motor_Dm4310SendMitControl(&axis->dm4310_motor);
+    }
+    else
+    {
+        (void)Motor_SendGm6020CurrentLoopFrame(&axis->gm6020_motor, NULL, NULL, NULL);
+    }
+}
+
+/* 对单轴运行一次角度外环 + 速度内环 PID。 */
 static void Control_RunAxisDualLoop(gimbal_axis_control_t *axis)
 {
     float angle_error;
@@ -210,30 +287,30 @@ static void Control_RunAxisDualLoop(gimbal_axis_control_t *axis)
                                          axis->wrap_enable);
 
     axis->target_speed_dps = PID_CalculateByError(&axis->angle_pid, angle_error);
-    axis->target_current = PID_Calculate(&axis->speed_pid,
-                                         axis->target_speed_dps,
-                                         axis->speed_feedback_dps);
+    axis->target_output = PID_Calculate(&axis->speed_pid,
+                                        axis->target_speed_dps,
+                                        axis->speed_feedback_dps);
 
-    Motor_SetGm6020CurrentLoopOutput(&axis->motor, (int16_t)axis->target_current);
+    Control_SetAxisMotorOutput(axis, axis->target_output);
 }
 
-/* 只清 PID 内部状态，不改当前目标角。 */
+/* 清除单轴 PID 历史和缓存输出。 */
 static void Control_ClearAxisController(gimbal_axis_control_t *axis)
 {
     PID_Reset(&axis->angle_pid);
     PID_Reset(&axis->speed_pid);
     axis->target_speed_dps = 0.0f;
-    axis->target_current = 0.0f;
+    axis->target_output = 0.0f;
 }
 
-/* 清空单轴控制器状态，并把输出电流拉回 0。 */
+/* 清除单轴控制状态，并将该轴输出置零。 */
 static void Control_ResetAxisState(gimbal_axis_control_t *axis)
 {
     Control_ClearAxisController(axis);
-    Motor_SetGm6020CurrentLoopOutput(&axis->motor, 0);
+    Control_SetAxisMotorOutput(axis, 0.0f);
 }
 
-/* 把两轴目标角都对齐到当前反馈角。 */
+/* 将全部轴目标对齐到当前反馈。 */
 static void Control_AlignAllTargetsToFeedback(void)
 {
     Control_AlignAxisTargetToFeedback(&gimbal_control.pitch);
@@ -241,15 +318,10 @@ static void Control_AlignAllTargetsToFeedback(void)
 }
 
 /*
- * 模式切换时统一处理目标角和 PID 状态。
+ * 处理模式变化时只需要执行一次的动作。
  *
- * 核心原则：
- * 1. 切模式时尽量避免目标角突变
- * 2. 切模式时把 PID 的积分和微分状态清掉
- * 3. 无力模式下直接清输出
- *
- * 这里单独集中处理，主要是为了避免各个模式分支自己改一套，
- * 最后出现“某个模式切进去会抽一下、另一个模式切回来会跳一下”的问题。
+ * RELAX 会清控制器和输出；主动控制模式会先把目标对齐到最新反馈，
+ * 再清 PID 历史，避免切模式瞬间冲击。
  */
 static void Control_HandleModeTransition(void)
 {
@@ -263,15 +335,16 @@ static void Control_HandleModeTransition(void)
         case CONTROL_MODE_RELAX:
             Control_ResetAxisState(&gimbal_control.pitch);
             Control_ResetAxisState(&gimbal_control.yaw);
+            gimbal_control.init_finished = 0U;
             break;
 
-        case CONTROL_MODE_REMOTE:
-            Control_AlignAllTargetsToFeedback();
+        case CONTROL_MODE_INIT:
             Control_ClearAxisController(&gimbal_control.pitch);
             Control_ClearAxisController(&gimbal_control.yaw);
+            gimbal_control.init_finished = 0U;
             break;
 
-        case CONTROL_MODE_KEY_MOUSE:
+        case CONTROL_MODE_FOLLOW_ZGYRO:
             Control_AlignAllTargetsToFeedback();
             Control_ClearAxisController(&gimbal_control.pitch);
             Control_ClearAxisController(&gimbal_control.yaw);
@@ -287,80 +360,113 @@ static void Control_HandleModeTransition(void)
     gimbal_control.initialized = 1U;
 }
 
-/*
- * 根据遥控器挡位和暂停键决定当前应该进入什么模式。
- *
- * 当前优先级从高到低是：
- * 1. pause -> RELAX
- * 2. C 挡 -> RELAX
- * 3. N 挡 -> REMOTE
- * 4. S 挡 -> KEY_MOUSE
- * 5. 兜底回 RELAX
- */
-static control_mode_t Control_DecodeRemoteMode(const remote_state_t *remote)
+/* 刷新 Mode_Switch_Task 需要使用的在线状态标志。 */
+void Control_Task_UpdateOnlineFlags(const imu_hi91_t *imu, const remote_state_t *remote)
 {
-    if ((remote == NULL) || (remote->online == 0U))
-    {
-        return CONTROL_MODE_RELAX;
-    }
-
-    if (remote->pause_pressed != 0U)
-    {
-        return CONTROL_MODE_RELAX;
-    }
-
-    if (remote->gear == CONTROL_MODE_GEAR_REMOTE)
-    {
-        return CONTROL_MODE_REMOTE;
-    }
-
-    if (remote->gear == CONTROL_MODE_GEAR_KEY_MOUSE)
-    {
-        return CONTROL_MODE_KEY_MOUSE;
-    }
-
-    if (remote->gear == CONTROL_MODE_GEAR_RELAX)
-    {
-        return CONTROL_MODE_RELAX;
-    }
-
-    return CONTROL_MODE_RELAX;
-}
-
-/*
- * 刷新系统在线状态，并结合遥控状态决定当前模式。
- *
- * 保护优先级比遥控挡位更高：
- * 1. IMU 掉线 -> 强制 RELAX
- * 2. 任一云台电机掉线 -> 强制 RELAX
- * 3. 只有关键反馈都在线时，才允许按遥控挡位选模式
- *
- * 这样可以保证传感器或执行器掉线时，云台不会继续带着旧反馈盲跑。
- */
-static void Control_UpdateSystemStatus(const imu_hi91_t *imu, const remote_state_t *remote)
-{
-    gimbal_control.last_mode = gimbal_control.mode;
     gimbal_control.imu_online = (uint8_t)((imu != NULL) ? imu->online : 0U);
     gimbal_control.remote_online = (uint8_t)((remote != NULL) ? remote->online : 0U);
-    gimbal_control.pitch_motor_online = Motor_Gm6020IsOnline(&gimbal_control.pitch.motor);
-    gimbal_control.yaw_motor_online = Motor_Gm6020IsOnline(&gimbal_control.yaw.motor);
+    gimbal_control.pitch_motor_online = Control_IsAxisMotorOnline(&gimbal_control.pitch);
+    gimbal_control.yaw_motor_online = Control_IsAxisMotorOnline(&gimbal_control.yaw);
+}
 
-    if ((gimbal_control.imu_online == 0U)
-     || (gimbal_control.pitch_motor_online == 0U)
-     || (gimbal_control.yaw_motor_online == 0U))
+/* 保存 Mode_Switch_Task 在这一拍选出的控制模式。 */
+void Control_Task_SetMode(control_mode_t mode)
+{
+    gimbal_control.last_mode = gimbal_control.mode;
+    gimbal_control.mode = mode;
+}
+
+void Control_Task_UpdateFeedback(const imu_hi91_t *imu)
+{
+    if (imu == NULL)
     {
-        gimbal_control.mode = CONTROL_MODE_RELAX;
         return;
     }
 
-    gimbal_control.mode = Control_DecodeRemoteMode(remote);
+    Control_UpdateAxisFeedback(&gimbal_control.pitch, imu);
+    Control_UpdateAxisFeedback(&gimbal_control.yaw, imu);
+}
+
+void Control_Task_UpdateInitTargets(void)
+{
+    float pitch_error;
+    float yaw_error;
+
+    /*
+     * 让 pitch 回到 0，让 yaw 回到最近的 0 度等效位置。
+     * Up_Task 在调用本函数前已经刷新过反馈。
+     */
+    gimbal_control.pitch.target_angle_deg = CONTROL_INIT_PITCH_TARGET_DEG;
+    gimbal_control.yaw.target_angle_deg = Control_CalcNearestWrappedReference(CONTROL_INIT_YAW_TARGET_DEG,
+                                                                              gimbal_control.yaw.angle_feedback_deg);
+
+    Control_ClampAxisTarget(&gimbal_control.pitch);
+    Control_ClampAxisTarget(&gimbal_control.yaw);
+
+    pitch_error = Control_CalcAngleError(gimbal_control.pitch.target_angle_deg,
+                                         gimbal_control.pitch.angle_feedback_deg,
+                                         gimbal_control.pitch.wrap_enable);
+    yaw_error = Control_CalcAngleError(gimbal_control.yaw.target_angle_deg,
+                                       gimbal_control.yaw.angle_feedback_deg,
+                                       gimbal_control.yaw.wrap_enable);
+
+    if ((fabsf(pitch_error) <= CONTROL_INIT_PITCH_FINISH_ERROR_DEG)
+     && (fabsf(yaw_error) <= CONTROL_INIT_YAW_FINISH_ERROR_DEG))
+    {
+        /* 这个标志对应原工程里的 if_finish_Init。 */
+        gimbal_control.init_finished = 1U;
+    }
+}
+
+uint8_t Control_Task_IsInitFinished(void)
+{
+    return gimbal_control.init_finished;
+}
+
+void Control_Task_ClearInitFinished(void)
+{
+    gimbal_control.init_finished = 0U;
+}
+
+void Control_Task_UpdateRemoteTargets(const remote_state_t *remote, float scale_ratio)
+{
+    Control_UpdateAxisTargetByRemote(&gimbal_control.pitch, remote, scale_ratio);
+    Control_UpdateAxisTargetByRemote(&gimbal_control.yaw, remote, scale_ratio);
+}
+
+void Control_Task_UpdateMouseTargets(int16_t mouse_x, int16_t mouse_y)
+{
+    Control_UpdateAxisTargetByMouse(&gimbal_control.pitch, mouse_y);
+    Control_UpdateAxisTargetByMouse(&gimbal_control.yaw, mouse_x);
+}
+
+void Control_Task_HandleModeTransition(void)
+{
+    Control_HandleModeTransition();
+}
+
+void Control_Task_StopOutput(void)
+{
+    Control_StopGimbalOutput();
+}
+
+void Control_Task_SendOutput(void)
+{
+    Control_SendGimbalOutput();
+}
+
+void Control_Task_RunClosedLoop(void)
+{
+    Control_ApplyAxisLimitProtection(&gimbal_control.pitch);
+    Control_ApplyAxisLimitProtection(&gimbal_control.yaw);
+
+    Control_RunAxisDualLoop(&gimbal_control.pitch);
+    Control_RunAxisDualLoop(&gimbal_control.yaw);
 }
 
 /*
- * 无力模式下把两轴输出都拉回 0。
- *
- * 注意这里不仅是“发送 0 电流”这么简单，
- * 还会把 PID 内部状态一起清掉，避免后面重新上电流时把旧积分一下子打出来。
+ * 强制两轴输出为 0，并清除 PID 状态。
+ * Up_Task 在 RELAX 模式下调用。
  */
 static void Control_StopGimbalOutput(void)
 {
@@ -368,21 +474,23 @@ static void Control_StopGimbalOutput(void)
     Control_ResetAxisState(&gimbal_control.pitch);
 }
 
-/* 发送两轴当前已经缓存好的电流指令。 */
+/* 发送两轴最新准备好的控制命令。 */
 static void Control_SendGimbalOutput(void)
 {
-    (void)Motor_SendGm6020CurrentLoopFrame(&gimbal_control.pitch.motor, NULL, NULL, NULL);
-    (void)Motor_SendGm6020CurrentLoopFrame(&gimbal_control.yaw.motor, NULL, NULL, NULL);
+    Control_SendAxisMotorOutput(&gimbal_control.pitch);
+    Control_SendAxisMotorOutput(&gimbal_control.yaw);
 }
 
-/* 配置 Pitch 轴的电机挂载、输入映射、限位和 PID 参数。 */
+/* 配置 pitch 轴电机绑定、PID 参数和限位。 */
 static void Control_ConfigPitchAxis(void)
 {
     gimbal_axis_control_t *axis;
 
     axis = &gimbal_control.pitch;
+    axis->motor_type = CONTROL_AXIS_MOTOR_GM6020;
+    axis->output_sign = CONTROL_PITCH_OUTPUT_SIGN;
 
-    if (Motor_RegisterGm6020CurrentLoop(&axis->motor,
+    if (Motor_RegisterGm6020CurrentLoop(&axis->gm6020_motor,
                                         CONTROL_PITCH_MOTOR_CAN,
                                         CONTROL_PITCH_MOTOR_ID) != HAL_OK)
     {
@@ -416,19 +524,30 @@ static void Control_ConfigPitchAxis(void)
     axis->remote_channel_index = CONTROL_REMOTE_PITCH_CHANNEL_INDEX;
 }
 
-/* 配置 Yaw 轴的电机挂载、输入映射、限位和 PID 参数。 */
+/* 配置 yaw 轴电机绑定、PID 参数和回环行为。 */
 static void Control_ConfigYawAxis(void)
 {
     gimbal_axis_control_t *axis;
 
     axis = &gimbal_control.yaw;
+    axis->motor_type = CONTROL_AXIS_MOTOR_DM4310;
+    axis->output_sign = CONTROL_YAW_OUTPUT_SIGN;
 
-    if (Motor_RegisterGm6020CurrentLoop(&axis->motor,
-                                        CONTROL_YAW_MOTOR_CAN,
-                                        CONTROL_YAW_MOTOR_ID) != HAL_OK)
+    if (Motor_RegisterDm4310Mit(&axis->dm4310_motor,
+                                CONTROL_YAW_MOTOR_CAN,
+                                CONTROL_YAW_MOTOR_ID,
+                                CONTROL_YAW_DM4310_FEEDBACK_STD_ID) != HAL_OK)
     {
         Error_Handler();
     }
+
+    /*
+     * 当前安装下 yaw DM4310 的反馈极性与 IMU 坐标系相反。
+     * 这里反向电机反馈，使控制环继续以 IMU yaw / gyro 为参考。
+     */
+    axis->dm4310_motor.feedback_angle_sign = -1.0f;
+    axis->dm4310_motor.feedback_speed_sign = -1.0f;
+    (void)Motor_Dm4310SendEnable(&axis->dm4310_motor);
 
     PID_Init(&axis->angle_pid,
              CONTROL_YAW_ANGLE_KP,
@@ -458,16 +577,8 @@ static void Control_ConfigYawAxis(void)
 }
 
 /*
- * 初始化云台控制任务。
- *
- * 调用时机：
- * - main() 完成 HAL 外设初始化和 BSP_Init() 之后调用一次。
- *
- * 初始化内容：
- * - 清空任务上下文；
- * - 注册 Pitch / Yaw 两个 GM6020 到 motor 层；
- * - 初始化两轴角度环和速度环 PID 参数；
- * - 默认进入 RELAX，避免上电瞬间直接输出电流。
+ * 初始化可复用控制状态、电机服务和 PID 控制器。
+ * 需要在 BSP 和底层电机支持就绪后调用一次。
  */
 void Control_Task_Init(void)
 {
@@ -475,81 +586,17 @@ void Control_Task_Init(void)
     gimbal_control.mode = CONTROL_MODE_RELAX;
     gimbal_control.last_mode = CONTROL_MODE_RELAX;
 
-    /* 当前工程约定：Pitch 用 CAN1 上的 ID1 GM6020 电流环。 */
     Control_ConfigPitchAxis();
-    /* 当前工程约定：Yaw 用 CAN2 上的 ID5 GM6020 电流环。 */
     Control_ConfigYawAxis();
 }
 
 /*
- * 云台控制任务主入口。
- *
- * 每次调用按下面顺序执行：
- * 1. 获取 IMU / 遥控状态；
- * 2. 刷新在线标志并决定当前模式；
- * 3. 在线时刷新姿态反馈；
- * 4. 处理模式切换带来的目标角同步和 PID 清零；
- * 5. 根据当前模式用摇杆或鼠标更新目标角；
- * 6. 执行限位保护和双环 PID；
- * 7. 下发 GM6020 电流控制帧。
+ * 
+ * 运行时顺序刻意交给 Up_Task_Run()，确保 Up_Task.c 仍然是真正控制逻辑入口。
  */
 void Control_Task_Run(void)
 {
-    const imu_hi91_t *imu;
-    const remote_state_t *remote;
-
-    /* 读取各模块维护的最新状态指针；底层模块负责刷新这些数据。 */
-    imu = IMU_GetState();
-    remote = Remote_GetState();
-
-    /* 在线状态决定是否允许闭环，安全保护优先于遥控挡位。 */
-    Control_UpdateSystemStatus(imu, remote);
-
-    /* IMU 在线时才刷新姿态反馈，防止用掉线数据继续控制。 */
-    if (gimbal_control.imu_online != 0U)
-    {
-        Control_UpdateAxisFeedback(&gimbal_control.pitch, imu);
-        Control_UpdateAxisFeedback(&gimbal_control.yaw, imu);
-    }
-
-    /*
-     * 模式切换只在刚进入某个模式时执行一次，用来同步目标角和清 PID。
-     * 如果模式没有变化，则不会反复清控制器状态。
-     */
-    Control_HandleModeTransition();
-
-    /* RELAX 是最高优先级停机状态：清 PID、给 0 电流并立即返回。 */
-    if (gimbal_control.mode == CONTROL_MODE_RELAX)
-    {
-        Control_StopGimbalOutput();
-        Control_SendGimbalOutput();
-        return;
-    }
-
-    if (gimbal_control.mode == CONTROL_MODE_REMOTE)
-    {
-        Control_UpdateAxisTargetByRemote(&gimbal_control.pitch, remote, 1.0f);
-        Control_UpdateAxisTargetByRemote(&gimbal_control.yaw, remote, 1.0f);
-    }
-    else if (gimbal_control.mode == CONTROL_MODE_KEY_MOUSE)
-    {
-        Control_UpdateAxisTargetByMouse(&gimbal_control.pitch, remote->mouse_y);
-        Control_UpdateAxisTargetByMouse(&gimbal_control.yaw, remote->mouse_x);
-    }
-    else
-    {
-        /* 未知模式兜底不更新目标角，后续模式解码会回到 RELAX。 */
-    }
-
-    /* 双环计算前先做一次目标约束和机械限位保护。 */
-    Control_ApplyAxisLimitProtection(&gimbal_control.pitch);
-    Control_ApplyAxisLimitProtection(&gimbal_control.yaw);
-
-    Control_RunAxisDualLoop(&gimbal_control.pitch);
-    Control_RunAxisDualLoop(&gimbal_control.yaw);
-
-    /* 最后统一发 CAN，保证本次计算出的两轴输出都已经写入 motor 对象。 */
-    //Control_SendGimbalOutput();
+    Up_Task_Run();
 }
 
 const gimbal_control_task_t *Control_Task_GetState(void)

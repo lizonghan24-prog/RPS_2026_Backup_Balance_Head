@@ -17,8 +17,8 @@
         <TargetCommonOption>
           <Device>STM32F405RGTx</Device>
           <Vendor>STMicroelectronics</Vendor>
-          <PackID>Keil.STM32F4xx_DFP.2.15.0</PackID>
-          <PackURL>http://www.keil.com/pack/</PackURL>
+          <PackID>Keil.STM32F4xx_DFP.3.1.1</PackID>
+          <PackURL>https://www.keil.com/pack/</PackURL>
           <Cpu>IRAM(0x20000000-0x2001BFFF) IRAM2(0x2001C000-0x2001FFFF) IROM(0x8000000-0x80FFFFF)  CLOCK(25000000) FPU2 CPUTYPE("Cortex-M4") TZ</Cpu>
           <FlashUtilSpec></FlashUtilSpec>
           <StartupFile></StartupFile>
@@ -666,6 +666,36 @@
               <FileType>5</FileType>
               <FilePath>..\BSP\senior.h</FilePath>
             </File>
+            <File>
+              <FileName>USART_chassis_transmit.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\BSP\USART_chassis_transmit.c</FilePath>
+            </File>
+            <File>
+              <FileName>USART_chassis_transmit.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\BSP\USART_chassis_transmit.h</FilePath>
+            </File>
+            <File>
+              <FileName>motor_dm.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\BSP\motor_dm.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_dm.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\BSP\motor_dm.h</FilePath>
+            </File>
+            <File>
+              <FileName>motor_lk.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\BSP\motor_lk.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_lk.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\BSP\motor_lk.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -700,6 +730,26 @@
               <FileName>CANBus_Task.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\TASK\CANBus_Task.h</FilePath>
+            </File>
+            <File>
+              <FileName>Up_Task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\TASK\Up_Task.c</FilePath>
+            </File>
+            <File>
+              <FileName>Up_Task.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\TASK\Up_Task.h</FilePath>
+            </File>
+            <File>
+              <FileName>Mode_Switch_Task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\TASK\Mode_Switch_Task.c</FilePath>
+            </File>
+            <File>
+              <FileName>Mode_Switch_Task.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\TASK\Mode_Switch_Task.h</FilePath>
             </File>
           </Files>
         </Group>

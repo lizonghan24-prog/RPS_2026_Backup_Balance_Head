@@ -1,6 +1,9 @@
 #include "BSP.h"
-#include "Control_Task.h"
 #include "Shoot_Task.h"
+#include "Up_Task.h"
+#include "USART_chassis_transmit.h"
+#include "motor_dm.h"
+#include "motor_lk.h"
 
 #include <string.h>
 
@@ -10,12 +13,15 @@ extern CAN_HandleTypeDef hcan1;
 extern CAN_HandleTypeDef hcan2;
 extern TIM_HandleTypeDef htim6;
 extern UART_HandleTypeDef huart5;
+extern UART_HandleTypeDef huart3;
 extern UART_HandleTypeDef huart6;
 
 #define BSP_IMU_DMA_BUFFER_SIZE       256U
 #define BSP_IMU_RING_BUFFER_SIZE      2048U
 #define BSP_REMOTE_DMA_BUFFER_SIZE    64U
 #define BSP_REMOTE_RING_BUFFER_SIZE   256U
+#define BSP_CHASSIS_DMA_BUFFER_SIZE   64U
+#define BSP_CHASSIS_RING_BUFFER_SIZE  256U
 
 /* 简单环形缓冲，只负责把 DMA 收到的数据先存起来。 */
 typedef struct
@@ -40,11 +46,15 @@ static uint8_t imu_dma_buffer[BSP_IMU_DMA_BUFFER_SIZE];
 static uint8_t imu_ring_storage[BSP_IMU_RING_BUFFER_SIZE];
 static uint8_t remote_dma_buffer[BSP_REMOTE_DMA_BUFFER_SIZE];
 static uint8_t remote_ring_storage[BSP_REMOTE_RING_BUFFER_SIZE];
+static uint8_t chassis_dma_buffer[BSP_CHASSIS_DMA_BUFFER_SIZE];
+static uint8_t chassis_ring_storage[BSP_CHASSIS_RING_BUFFER_SIZE];
 static uint8_t imu_poll_buffer[128];
 static uint8_t remote_poll_buffer[64];
+static uint8_t chassis_poll_buffer[64];
 
 static bsp_uart_dma_channel_t imu_uart_channel;
 static bsp_uart_dma_channel_t remote_uart_channel;
+static bsp_uart_dma_channel_t chassis_uart_channel;
 
 /* 初始化一个空的环形缓冲。 */
 static void BSP_RingInit(bsp_ring_buffer_t *ring, uint8_t *buffer, uint16_t size)
@@ -103,6 +113,11 @@ static bsp_uart_dma_channel_t *BSP_FindUartChannel(UART_HandleTypeDef *huart)
     if (huart == remote_uart_channel.huart)
     {
         return &remote_uart_channel;
+    }
+
+    if (huart == chassis_uart_channel.huart)
+    {
+        return &chassis_uart_channel;
     }
 
     return NULL;
@@ -234,7 +249,10 @@ void BSP_Init(void)
 {
     Remote_Init();
     IMU_Init();
+    USART_Chassis_Init();
     Motor_Init();
+    Motor_Dm4310ServiceInit();
+    Motor_LkServiceInit();
 
     /* USART6 给 IMU，缓存稍大一点，避免 1 kHz 数据堆积。 */
     BSP_RingInit(&imu_uart_channel.ring, imu_ring_storage, BSP_IMU_RING_BUFFER_SIZE);
@@ -248,8 +266,14 @@ void BSP_Init(void)
     remote_uart_channel.dma_buffer = remote_dma_buffer;
     remote_uart_channel.dma_buffer_size = BSP_REMOTE_DMA_BUFFER_SIZE;
 
+    BSP_RingInit(&chassis_uart_channel.ring, chassis_ring_storage, BSP_CHASSIS_RING_BUFFER_SIZE);
+    chassis_uart_channel.huart = &huart3;
+    chassis_uart_channel.dma_buffer = chassis_dma_buffer;
+    chassis_uart_channel.dma_buffer_size = BSP_CHASSIS_DMA_BUFFER_SIZE;
+
     BSP_StartUartDmaChannel(&imu_uart_channel);
     BSP_StartUartDmaChannel(&remote_uart_channel);
+    BSP_StartUartDmaChannel(&chassis_uart_channel);
 
     BSP_InitCan(&hcan1, 0U);
     BSP_InitCan(&hcan2, 14U);
@@ -269,9 +293,11 @@ void BSP_Poll(void)
      */
     BSP_MoveDmaToRing(&imu_uart_channel);
     BSP_MoveDmaToRing(&remote_uart_channel);
+    BSP_MoveDmaToRing(&chassis_uart_channel);
 
     BSP_PollSerialChannel(&imu_uart_channel, imu_poll_buffer, sizeof(imu_poll_buffer), IMU_Process);
     BSP_PollSerialChannel(&remote_uart_channel, remote_poll_buffer, sizeof(remote_poll_buffer), Remote_Process);
+    BSP_PollSerialChannel(&chassis_uart_channel, chassis_poll_buffer, sizeof(chassis_poll_buffer), USART_Chassis_Process);
 }
 
 void BSP_HandleUartIdle(UART_HandleTypeDef *huart)
@@ -306,6 +332,8 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
         }
 
         Motor_ProcessCanMessage(hcan, &rx_header, rx_data);
+        Motor_Dm4310ProcessCanMessage(hcan, &rx_header, rx_data);
+        Motor_LkProcessCanMessage(hcan, &rx_header, rx_data);
     }
 }
 
@@ -314,7 +342,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     /* TIM6 每次到期直接执行控制任务。 */
     if (htim->Instance == TIM6)
     {
-        Control_Task_Run();
+        Up_Task_Run();
         Shoot_Task_Run();
     }
 }

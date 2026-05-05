@@ -23,7 +23,7 @@ extern "C" {
 /* ========================= GM6020 / 舵向电机机械零点配置 ========================= */
 /* Pitch 轴 GM6020 编码器初始机械零点。 */
 #define GMPitchEncoder_Offset                   6165
-/* Yaw 轴 GM6020 编码器初始机械零点。 */
+/* 旧 GM6020 yaw 编码器零点；当前 yaw 已换成 CAN2 ID1 DM4310，此宏只给旧代码兼容用。 */
 #define GMYawEncoder_Offset                     1412
 /* 四个舵轮底盘转向电机的编码器初始机械零点。 */
 #define GM1Encoder_Offset                       1437
